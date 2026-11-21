@@ -1,7 +1,10 @@
+//! fast-path interpreter for static PGF pictures and Matplotlib PGF output.
 use super::drawing::*;
+use super::labels;
 use super::pgf::{Argument, Event, Parser};
+use kurbo::{Affine, BezPath, Circle, PathEl, Rect, Shape};
 use std::collections::HashMap;
-use std::fmt::Write;
+use std::rc::Rc;
 
 fn opacity(s: &str) -> Result<f64> {
     s.trim()
@@ -11,7 +14,15 @@ fn opacity(s: &str) -> Result<f64> {
         .ok_or_else(|| format!("invalid opacity {s:?}"))
 }
 
-fn dimension(s: &str) -> Result<f64> {
+pub(super) fn scalar(s: &str) -> Result<f64> {
+    s.trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|n| n.is_finite())
+        .ok_or_else(|| format!("expected a finite number in {s:?}"))
+}
+
+pub(super) fn dimension(s: &str) -> Result<f64> {
     let s = s.trim();
     for (unit, factor) in [
         ("bp", 1.),
@@ -32,7 +43,7 @@ fn dimension(s: &str) -> Result<f64> {
     Err(format!("expected an absolute PGF dimension, got {s:?}"))
 }
 
-fn point_command(s: &str) -> Result<(&str, Vec<Argument<'_>>)> {
+pub(super) fn point_command(s: &str) -> Result<(&str, Vec<Argument<'_>>)> {
     let mut parser = Parser::new(s);
     if let Some(Event::Command { name, args }) = parser.next_event()? {
         if parser.next_event()?.is_none() {
@@ -51,13 +62,22 @@ fn absolute(name: &str, args: &[Argument<'_>]) -> Result<Point> {
     }
 }
 
-fn point(s: &str) -> Result<Point> {
+pub(super) fn point(s: &str) -> Result<Point> {
+    // literal points account for nearly every argument in a Matplotlib path.
+    if let Some((x, y)) = s
+        .strip_prefix(r"\pgfqpoint{")
+        .or_else(|| s.strip_prefix(r"\pgfpoint{"))
+        .and_then(|s| s.strip_suffix('}'))
+        .and_then(|s| s.split_once("}{"))
+    {
+        return Ok([dimension(x)?, dimension(y)?]);
+    }
     let (name, args) = point_command(s)?;
     absolute(name, &args)
 }
 
 /// read a label position expressed in absolute or named coordinates.
-fn position(s: &str) -> Result<Position> {
+pub(super) fn position(s: &str) -> Result<Position> {
     use Argument::Required as R;
     let (name, args) = point_command(s)?;
     match (name, args.as_slice()) {
@@ -77,31 +97,11 @@ fn position(s: &str) -> Result<Position> {
     }
 }
 
-fn uncomment(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '%' => {
-                while chars.next_if(|c| !matches!(c, '\r' | '\n')).is_some() {}
-                chars.next_if_eq(&'\r');
-                chars.next_if_eq(&'\n');
-                while chars.next_if(|c| matches!(c, ' ' | '\t')).is_some() {}
-            }
-            '\\' => {
-                out.push(c);
-                if let Some(next) = chars.next() {
-                    out.push(next);
-                }
-            }
-            _ => out.push(c),
-        }
-    }
-    out
-}
-
 #[derive(Clone)]
 struct State {
+    transform: Affine,
+    clips: Vec<Rc<Clip>>,
+    viewport_clip: bool,
     stroke: Stroke,
     fill: Color,
     fill_opacity: f64,
@@ -109,30 +109,41 @@ struct State {
     colors: HashMap<String, Color>,
 }
 
-impl State {
-    fn color(&self, name: &str) -> Result<Color> {
-        if let Some(c) = self.colors.get(name) {
-            return Ok(*c);
-        }
-        let rgb = match name {
-            "black" => BLACK,
-            "white" => [255; 3],
-            "red" => [255, 0, 0],
-            "green" => [0, 255, 0],
-            "blue" => [0, 0, 255],
-            "cyan" => [0, 255, 255],
-            "magenta" => [255, 0, 255],
-            "yellow" => [255, 255, 0],
-            "gray" => [128; 3],
-            _ => return Err(format!("unknown PGF color {name:?}")),
-        };
-        Ok(rgb)
+pub(super) fn resolve_color(
+    colors: Option<&HashMap<String, Color>>,
+    name: &str,
+) -> Result<Color> {
+    if let Some(c) = colors.and_then(|map| map.get(name)) {
+        return Ok(*c);
     }
+    let rgb = match name {
+        "black" => BLACK,
+        "white" => [255; 3],
+        "red" => [255, 0, 0],
+        "green" => [0, 255, 0],
+        "blue" => [0, 0, 255],
+        "cyan" => [0, 255, 255],
+        "magenta" => [255, 0, 255],
+        "yellow" => [255, 255, 0],
+        "gray" => [128; 3],
+        _ => return Err(format!("unknown PGF color {name:?}")),
+    };
+    Ok(rgb)
 }
 
 fn define_color(model: &str, s: &str) -> Result<Color> {
     if model == "HTML" {
         return parse_hex(s);
+    }
+    if model == "gray" {
+        let g = s
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|v| (0.0..=1.0).contains(v))
+            .map(|n| (255. * n).round() as u8)
+            .ok_or_else(|| format!("invalid gray component {s:?}"))?;
+        return Ok([g; 3]);
     }
     let comps: Vec<_> = s.split(',').map(str::trim).collect();
     let [r, g, b] = comps[..] else {
@@ -151,538 +162,143 @@ fn define_color(model: &str, s: &str) -> Result<Color> {
     Ok([channel(r)?, channel(g)?, channel(b)?])
 }
 
-fn label_runs(s: &str) -> Result<Vec<Run>> {
-    fn group(
-        chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
-        runs: &mut Vec<Run>,
-        bold: bool,
-        italic: bool,
-        depth: usize,
-    ) -> Result<()> {
-        if depth > 64 {
-            return Err("PGF label nesting exceeds 64 groups".into());
-        }
-        while let Some(c) = chars.next() {
-            match c {
-                '}' if depth > 0 => return Ok(()),
-                '{' => group(chars, runs, bold, italic, depth + 1)?,
-                '\\' => {
-                    let c = chars.next().ok_or("dangling label escape")?;
-                    if c.is_ascii_alphabetic() {
-                        let mut name = c.to_string();
-                        while let Some(c) = chars.next_if(|c| c.is_ascii_alphabetic()) {
-                            name.push(c);
-                        }
-                        if name == "textcolor"
-                            && chars.by_ref().take(7).collect::<String>() == "[HTML]{"
-                        {
-                            let hex = chars
-                                .by_ref()
-                                .take_while(|c| *c != '}')
-                                .collect::<String>();
-                            let fill = parse_hex(&hex)?;
-                            if chars.next() != Some('{') {
-                                return Err("expected a text color group".into());
-                            }
-                            let mut colored = Vec::new();
-                            group(chars, &mut colored, bold, italic, depth + 1)?;
-                            for run in &mut colored {
-                                run.fill.get_or_insert(fill);
-                            }
-                            runs.extend(colored);
-                            continue;
-                        }
-                        if chars.next() != Some('{') {
-                            return Err(format!("unsupported label macro \\{name}"));
-                        }
-                        match name.as_str() {
-                            "textbf" => group(chars, runs, true, italic, depth + 1)?,
-                            "textit" | "emph" => {
-                                group(chars, runs, bold, true, depth + 1)?
-                            }
-                            "textasciitilde" | "textasciicircum" | "textbackslash" => {
-                                if chars.next() != Some('}') {
-                                    return Err(format!(
-                                        "expected empty group after \\{name}"
-                                    ));
-                                }
-                                let value = match name.as_str() {
-                                    "textasciitilde" => "~",
-                                    "textasciicircum" => "^",
-                                    _ => "\\",
-                                };
-                                push_run(runs, value, bold, italic);
-                            }
-                            _ => return Err(format!("unsupported label macro \\{name}")),
-                        }
-                    } else if "{}%&#_$ ".contains(c) {
-                        push_run(runs, &c.to_string(), bold, italic);
-                    } else {
-                        return Err(format!("unsupported PGF label escape \\{c}"));
-                    }
-                }
-                '$' => {
-                    if chars.peek() == Some(&'$') {
-                        return Err("unsupported display math $$".into());
-                    }
-                    let mut math = String::new();
-                    let mut closed = false;
-                    while let Some(mc) = chars.next() {
-                        if mc == '\\' {
-                            math.push(mc);
-                            if let Some(next) = chars.next() {
-                                math.push(next);
-                            }
-                        } else if mc == '$' {
-                            closed = true;
-                            break;
-                        } else {
-                            math.push(mc);
-                        }
-                    }
-                    if !closed {
-                        return Err("unclosed inline math".into());
-                    }
-                    let translated = super::texmath::to_typst(&math)
-                        .ok_or_else(|| format!("unsupported TeX math: {math}"))?;
-                    push_math(runs, translated);
-                }
-                '#' | '^' | '_' | '~' | '&' | '}' => {
-                    return Err(format!("unsupported PGF label syntax {c}"))
-                }
-                c if c.is_whitespace() => {
-                    while chars.next_if(|c| c.is_whitespace()).is_some() {}
-                    push_run(runs, " ", bold, italic);
-                }
-                _ => push_run(runs, &c.to_string(), bold, italic),
-            }
-        }
-        if depth == 0 {
-            Ok(())
-        } else {
-            Err("unclosed label group".into())
-        }
-    }
-    let mut runs = Vec::new();
-    group(&mut s.chars().peekable(), &mut runs, false, false, 0)?;
-    Ok(runs)
+fn vertex(s: &str) -> Result<kurbo::Point> {
+    let [x, y] = point(s)?;
+    Ok(kurbo::Point::new(x, y))
 }
 
-fn label(options: &str, text: &str) -> Result<Item> {
-    let (mut at, mut vertical, mut horizontal) = (Position::Absolute([0., 0.]), "", "");
-    for opt in options.split(',').map(str::trim) {
-        match opt {
-            "" => {}
-            "left" => horizontal = "west",
-            "right" => horizontal = "east",
-            "top" => vertical = "north",
-            "bottom" => vertical = "south",
-            "base" => vertical = "base",
-            _ => {
-                let (key, value) = opt
-                    .split_once('=')
-                    .ok_or_else(|| format!("unsupported PGF text option {opt}"))?;
-                let value = value.trim();
-                let value = value
-                    .strip_prefix('{')
-                    .and_then(|v| v.strip_suffix('}'))
-                    .unwrap_or(value);
-                match key.trim() {
-                    "at" => at = position(value)?,
-                    "x" | "y" => {
-                        let Position::Absolute(p) = &mut at else {
-                            return Err(
-                                "use pgfpointadd for offsets from a named coordinate"
-                                    .into(),
-                            );
-                        };
-                        p[usize::from(key.trim() == "y")] = dimension(value)?;
-                    }
-                    _ => return Err(format!("unsupported PGF text option {opt}")),
+fn path_command(path: &mut BezPath, name: &str, args: &[Argument<'_>]) -> Result<bool> {
+    use Argument::Required as R;
+    match (name, args) {
+        ("pgfpathmoveto", [R(p)]) => path.move_to(vertex(p)?),
+        ("pgfpathrectangle" | "pgfpathrectanglecorners", [R(a), R(b)]) => {
+            let a = vertex(a)?;
+            let mut b = vertex(b)?;
+            if name == "pgfpathrectangle" {
+                b += a.to_vec2();
+            }
+            path.move_to(a);
+            path.line_to((b.x, a.y));
+            path.line_to(b);
+            path.line_to((a.x, b.y));
+            path.close_path();
+        }
+        ("pgfpathcircle", [R(at), R(radius)]) => {
+            let radius = dimension(radius)?;
+            if radius <= 0. {
+                return Err("expected a positive circle radius".into());
+            }
+            path.extend(Circle::new(vertex(at)?, radius).path_elements(0.001));
+        }
+        _ if !name.starts_with("pgfpath") => return Ok(false),
+        _ => {
+            if matches!(path.elements().last(), None | Some(PathEl::ClosePath)) {
+                return Err("expected an open PGF path".into());
+            }
+            match (name, args) {
+                ("pgfpathlineto", [R(p)]) => path.line_to(vertex(p)?),
+                ("pgfpathquadraticcurveto", [R(a), R(b)]) => {
+                    path.quad_to(vertex(a)?, vertex(b)?)
                 }
+                ("pgfpathcurveto", [R(a), R(b), R(c)]) => {
+                    path.curve_to(vertex(a)?, vertex(b)?, vertex(c)?)
+                }
+                ("pgfpathclose", [])
+                    if !matches!(path.elements().last(), Some(PathEl::MoveTo(_))) =>
+                {
+                    path.close_path()
+                }
+                _ => return Err(format!("unsupported PGF path command {name}")),
             }
         }
     }
-    let mut anchor = [vertical, horizontal]
-        .into_iter()
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>()
-        .join("-");
-    if anchor.is_empty() {
-        anchor = "center".into();
-    }
-    let image_text = text.trim();
-    if image_text.starts_with(r"\includegraphics") || image_text.starts_with(r"\pgfimage")
-    {
-        let (cmd, args) = point_command(image_text)?;
-        use Argument::{Optional as O, Required as R};
-        let (opts, name) = match args.as_slice() {
-            [R(name)] => ("", *name),
-            [O(opts), R(name)] => (*opts, *name),
-            _ => return Err(format!("invalid arguments to {cmd}")),
-        };
-        let (mut width, mut height) = (None, None);
-        for opt in opts.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-            match opt.split_once('=') {
-                Some(("width", v)) => width = Some(dimension(v)?),
-                Some(("height", v)) => height = Some(dimension(v)?),
-                Some(("interpolate", "true" | "false")) => {}
-                _ => return Err(format!("unsupported image option {opt}")),
+    Ok(true)
+}
+
+#[derive(Clone, Copy, Default)]
+struct Actions {
+    fill: bool,
+    stroke: bool,
+    clip: bool,
+    bounding_box: bool,
+}
+
+impl Actions {
+    fn parse(source: &str) -> Result<Self> {
+        let mut actions = Self::default();
+        for key in source.split(',').map(str::trim) {
+            match key {
+                "stroke" | "draw" => actions.stroke = true,
+                "fill" => actions.fill = true,
+                "clip" => actions.clip = true,
+                "use as bounding box" => actions.bounding_box = true,
+                "discard" | "" => {}
+                _ => return Err(format!("unsupported PGF path action {key:?}")),
             }
         }
-        return Ok(Item::Image {
-            at,
-            anchor,
-            file: super::resources::resolve(name)?,
-            width,
-            height,
-        });
+        Ok(actions)
     }
-    let mut body = text;
-    let mut font = None;
-    let mut size = None;
-    if let Some(rest) = body.strip_prefix(r"\fontspec{") {
-        let (family, rest) = rest.split_once('}').ok_or("unclosed font family")?;
-        font = Some(family.to_owned());
-        body = rest;
-    }
-    if let Some(rest) = body.strip_prefix(r"\fontsize{") {
-        let (value, rest) =
-            rest.split_once("}{").ok_or("expected fontsize and baseline skip")?;
-        let (_, rest) = rest.split_once('}').ok_or("unclosed fontsize")?;
-        size = Some(dimension(value).or_else(|_| dimension(&format!("{value}pt")))?);
-        body = rest
-            .strip_prefix(r"\selectfont")
-            .ok_or("expected selectfont after fontsize")?
-            .trim_start();
-    }
-    Ok(Item::Text { at, anchor, runs: label_runs(body)?, font, size })
 }
 
-#[derive(serde::Serialize)]
-struct HostLabel {
-    runs: Vec<Run>,
-    font: Option<String>,
-    size: Option<f64>,
-}
+type Object = Rc<[(Rc<BezPath>, Actions)]>;
 
-fn placeholder(
-    labels: &mut Vec<(String, HostLabel)>,
-    prefix: &str,
-    label: HostLabel,
-) -> String {
-    let key = format!("panfig-label-{prefix}-{}", labels.len());
-    let command = format!(r"\csname {key}\endcsname{{}}");
-    labels.push((key, label));
-    command
-}
-
-// preserve TeX math and its surrounding glue. Only replace literal spans once
-// the complete label has been recognized, since arbitrary macros can consume text.
-fn mixed_label(
-    body: &str,
-    size: Option<f64>,
-    labels: &mut Vec<(String, HostLabel)>,
-    prefix: &str,
-) -> Option<String> {
-    if body.contains(r"\$") || body.contains("$$") {
-        return None;
-    }
-    let pieces: Vec<_> = body.split('$').collect();
-    if pieces.len() % 2 == 0 {
-        return None;
-    }
-    let mut spans = Vec::new();
-    for (i, piece) in pieces.iter().enumerate() {
-        if i % 2 == 0 && !piece.trim().is_empty() {
-            spans.push((i, label_runs(piece.trim()).ok()?));
-        }
-    }
-    if spans.is_empty() {
-        return None;
-    }
-    let mut out = String::new();
-    let mut spans = spans.into_iter().peekable();
-    for (i, s) in pieces.into_iter().enumerate() {
-        if i % 2 == 1 {
-            out.push('$');
-            out.push_str(s);
-            out.push('$');
-        } else if let Some((_, runs)) = spans.next_if(|(idx, _)| *idx == i) {
-            out.push_str(&s[..s.len() - s.trim_start().len()]);
-            out.push_str(&placeholder(
-                labels,
-                prefix,
-                HostLabel { runs, font: None, size },
-            ));
-            out.push_str(&s[s.trim_end().len()..]);
-        } else {
-            out.push_str(s);
-        }
-    }
-    Some(out)
-}
-
-// matplotlib emits these active-character definitions inside the argument.
-// the percent after the definition command names the active character.
-fn matplotlib_label(
-    line: &str,
-    labels: &mut Vec<(String, HostLabel)>,
-    prefix: &str,
-) -> Option<String> {
-    const CATCODES: &str =
-        r"\catcode`\^=\active\def^{\ifmmode\sp\else\^{}\fi}\catcode`\%=\active\def%{\%}";
-    let (setup, rest) = line.split_once(CATCODES)?;
-    let body = rest.strip_suffix("}}%").or_else(|| rest.strip_suffix("}}"))?;
-    let (face, dimensions) = setup.rsplit_once(r"\fontsize{")?;
-    let outer = [r"{\sffamily", r"{\rmfamily", r"{\ttfamily"]
-        .iter()
-        .find_map(|f| face.strip_suffix(f))?;
-    if !dimensions.ends_with(r"}\selectfont") || body.contains('%') {
-        return None;
-    }
-    let (size, _) = dimensions.split_once("}{")?;
-    let size = dimension(size).or_else(|_| dimension(&format!("{size}pt"))).ok()?;
-    // lift the full text+math label into Typst and drop the TeX font selection so
-    // e-TeX does not need external .tfm metrics for host-rendered labels.
-    if let Ok(runs) = label_runs(body) {
-        let closing = rest[body.len()..].strip_prefix('}')?;
-        let key =
-            placeholder(labels, prefix, HostLabel { runs, font: None, size: Some(size) });
-        return Some(format!("{outer}{key}{closing}"));
-    }
-    let text = body.replace(r"\ensuremath{-}", "$-$");
-    let replaced = mixed_label(&text, Some(size), labels, prefix)?;
-    Some(format!("{setup}{CATCODES}{replaced}{}", &rest[body.len()..]))
-}
-
-fn node_body(rest: &str) -> Option<&str> {
-    // let TikZ execute coordinate and shape options before placing the text.
-    let i = rest.find(['{', ';', '%', '\\'])?;
-    let (body, tail) = Parser::new(&rest[i..]).group_argument()?;
-    tail.trim_start().starts_with(';').then_some(body)
-}
-
-/// bridge literal text to the host while TeX keeps control of math, color and transforms.
-pub fn named_labels(source: &str, prefix: &str) -> Result<Vec<u8>> {
-    #[derive(Clone, Default)]
-    struct Face {
-        font: Option<String>,
-        size: Option<f64>,
-        bold: bool,
-        italic: bool,
-    }
-    let mut labels = Vec::new();
-    let emit = |labels: &mut Vec<(String, HostLabel)>, text: &str, face: &Face| {
-        let mut runs = Vec::new();
-        push_run(&mut runs, text, face.bold, face.italic);
-        placeholder(
-            labels,
-            prefix,
-            HostLabel { runs, font: face.font.clone(), size: face.size },
-        )
-    };
-    fn control(s: &str) -> (&str, &str) {
-        let s = &s[1..];
-        let mut n = s
-            .bytes()
-            .take_while(|c| c.is_ascii_alphabetic() || *c == b'@')
-            .count();
-        if n == 0 {
-            n = s.chars().next().map_or(0, char::len_utf8);
-        }
-        s.split_at(n)
-    }
-    fn arg(s: &str) -> Option<(&str, &str)> {
-        let s = s.trim_start().strip_prefix('{')?;
-        let end = s.find('}')?;
-        Some((&s[..end], &s[end + 1..]))
-    }
-    let mut out = String::new();
-    let tikz = source.contains("tikzpicture");
-    let mut input = source;
-    while let Some(i) = input.find(['%', '\\']) {
-        out.push_str(&input[..i]);
-        let tail = &input[i..];
-        if tail.starts_with('%') {
-            let n = tail.find(['\n', '\r']).unwrap_or(tail.len());
-            out.push_str(&tail[..n]);
-            input = &tail[n..];
-            continue;
-        }
-        let (cmd, rest) = control(tail);
-        if cmd == "pgftext" {
-            let line = tail.lines().next().unwrap();
-            if let Some(replaced) = matplotlib_label(line, &mut labels, prefix) {
-                out.push_str(&replaced);
-                input = &tail[line.len()..];
-                continue;
-            }
-        }
-        let body = match cmd {
-            "pgftext" => match Parser::new(tail).next_event() {
-                Ok(Some(Event::Command { args, .. })) => {
-                    args.last().and_then(|arg| match arg {
-                        Argument::Required(body) => Some(*body),
-                        _ => None,
-                    })
-                }
-                _ => None,
-            },
-            "node" if tikz => node_body(rest),
-            _ => None,
-        };
-        if let Some(body) = body {
-            let n = body.as_ptr() as usize - tail.as_ptr() as usize;
-            out.push_str(&tail[..n]);
-            // let Typst measure a complete literal label before TeX places the box.
-            let clean = uncomment(body);
-            if !clean.is_empty() {
-                let replaced = match label("", &clean) {
-                    Ok(Item::Text { runs, font, size, .. }) => Some(placeholder(
-                        &mut labels,
-                        prefix,
-                        HostLabel { runs, font, size },
-                    )),
-                    _ if clean.contains('$') => {
-                        mixed_label(&clean, None, &mut labels, prefix)
-                    }
-                    _ => None,
+// a marker records geometry once. its fill and pen are inherited at each use.
+fn object(body: &str) -> Result<Object> {
+    let mut parser = Parser::new(body);
+    let mut path = BezPath::new();
+    let mut paths = Vec::new();
+    while let Some(event) = parser.next_event()? {
+        match event {
+            Event::Command { name: "pgfusepath", args } => {
+                let [Argument::Required(actions)] = args.as_slice() else {
+                    return Err("invalid object path actions".into());
                 };
-                if let Some(replaced) = replaced {
-                    out.push_str(&replaced);
-                    input = &tail[n + body.len()..];
-                    continue;
+                let actions = Actions::parse(actions)?;
+                if actions.bounding_box {
+                    return Err("bounding box in a static object".into());
                 }
+                paths.push((Rc::new(std::mem::take(&mut path)), actions));
             }
-            if !body.contains(r"\fontspec") && body.chars().all(|ch| ch as u32 <= 255) {
-                out.push_str(body);
-                input = &tail[n + body.len()..];
-                continue;
-            }
-            let mut s = clean.as_str();
-            let mut face = Face::default();
-            let mut stack = vec![];
-            let mut math = false;
-            while !s.is_empty() {
-                let start = s;
-                let ch = s.chars().next().unwrap();
-                s = &s[ch.len_utf8()..];
-                match ch {
-                    '$' => math = !math,
-                    '{' => stack.push(face.clone()),
-                    '}' => face = stack.pop().unwrap_or_default(),
-                    '\\' => {
-                        let (name, after) = control(start);
-                        s = after;
-                        if !math {
-                            match name {
-                                "fontspec" => {
-                                    if let Some((family, next)) = arg(s) {
-                                        face.font = Some(family.to_owned());
-                                        s = next;
-                                        out.push_str(r"\relax{}");
-                                        continue;
-                                    }
-                                }
-                                "fontsize" => {
-                                    if let Some((size, (_, next))) =
-                                        arg(s).and_then(|(v, n)| Some((v, arg(n)?)))
-                                    {
-                                        face.size = dimension(size)
-                                            .or_else(|_| dimension(&format!("{size}pt")))
-                                            .ok();
-                                        s = next;
-                                    }
-                                }
-                                "bfseries" => face.bold = true,
-                                "itshape" | "slshape" => face.italic = true,
-                                "color" | "includegraphics" | "pgfimage" => {
-                                    let opts = s.trim_start();
-                                    let rest = if opts.starts_with('[') {
-                                        opts.split_once(']')
-                                            .map(|(_, r)| r)
-                                            .unwrap_or(opts)
-                                    } else {
-                                        opts
-                                    };
-                                    if let Some((_, next)) = arg(rest) {
-                                        s = next;
-                                    }
-                                }
-                                _ => (),
-                            }
-                        }
-                    }
-                    _ if !math
-                        && (ch as u32 > 255
-                            || (face.font.is_some()
-                                && !ch.is_whitespace()
-                                && !"#_^~&".contains(ch))) =>
-                    {
-                        let end = s
-                            .find(|c: char| {
-                                if face.font.is_some() {
-                                    "\\{}$%#_^~&".contains(c)
-                                } else {
-                                    c as u32 <= 255
-                                }
-                            })
-                            .unwrap_or(s.len());
-                        let count = ch.len_utf8() + end;
-                        out.push_str(&emit(&mut labels, &start[..count], &face));
-                        s = &start[count..];
-                        continue;
-                    }
-                    _ => (),
-                }
-                out.push_str(&start[..start.len() - s.len()]);
-            }
-            input = &tail[n + body.len()..];
-            continue;
+            Event::Command { name, args } if path_command(&mut path, name, &args)? => {}
+            _ => return Err("unsupported static object body".into()),
         }
-        out.push_str(&tail[..tail.len() - rest.len()]);
-        input = rest;
     }
-    out.push_str(input);
-    // nodes and macro-expanded character arguments go through inputenc.
-    let mut declarations = String::new();
-    for ch in uncomment(&out)
-        .chars()
-        .filter(|c| *c as u32 > 255)
-        .collect::<std::collections::BTreeSet<_>>()
-    {
-        writeln!(
-            declarations,
-            r"\DeclareUnicodeCharacter{{{:X}}}{{{}}}",
-            ch as u32,
-            emit(&mut labels, &ch.to_string(), &Face::default())
-        )
-        .unwrap();
+    if !path.elements().is_empty() {
+        return Err("unfinished object path".into());
     }
-    serde_json::to_vec(
-        &serde_json::json!({"source":out,"declarations":declarations,"labels":labels}),
-    )
-    .map_err(|e| e.to_string())
+    Ok(paths.into())
+}
+
+fn rectangle(path: &BezPath) -> Option<Rect> {
+    let [PathEl::MoveTo(a), PathEl::LineTo(b), PathEl::LineTo(c), PathEl::LineTo(d), PathEl::ClosePath] =
+        path.elements()
+    else {
+        return None;
+    };
+    ((a.x == b.x && b.y == c.y && c.x == d.x && d.y == a.y)
+        || (a.y == b.y && b.x == c.x && c.y == d.y && d.x == a.x))
+        .then(|| Rect::from_points(*a, *c))
 }
 
 struct Reader {
     figure: Figure,
-    contours: Vec<Contour>,
+    path: BezPath,
+    objects: HashMap<String, Object>,
     state: State,
     scopes: Vec<(String, State)>,
 }
 
 impl Reader {
     fn open(&mut self, name: &str) -> Result<()> {
-        if !self.contours.is_empty() {
+        if !self.path.elements().is_empty() {
             return Err("scope change inside an unfinished path".into());
         }
         self.scopes.push((name.into(), self.state.clone()));
         Ok(())
     }
+
     fn close(&mut self, name: &str) -> Result<()> {
-        if !self.contours.is_empty() {
+        if !self.path.elements().is_empty() {
             return Err("scope ends with an unfinished path".into());
         }
         let (open, state) =
@@ -693,45 +309,83 @@ impl Reader {
         self.state = state;
         Ok(())
     }
-    fn curve(&mut self) -> Result<(&mut Vec<Segment>, &mut bool)> {
-        match self.contours.last_mut() {
-            Some(Contour::Curve { segments, closed, .. }) if !*closed => {
-                Ok((segments, closed))
-            }
-            _ => Err("expected an open path after pgfpathmoveto".into()),
+
+    fn place(&mut self, item: Item, angle: f64) -> Result<()> {
+        if self.figure.viewport.is_some() && !self.state.viewport_clip {
+            return Err("drawing outside the bounding box scope".into());
         }
+        self.figure.items.push(Placed {
+            item,
+            transform: self.state.transform,
+            angle,
+            clips: self.state.clips.clone(),
+        });
+        Ok(())
     }
-    fn use_path(&mut self, actions: &str) -> Result<()> {
-        let mut style = Style {
-            stroke: None,
-            fill: None,
-            fill_opacity: 1.,
+
+    fn use_path(&mut self, path: Rc<BezPath>, actions: Actions) -> Result<()> {
+        let style = Style {
+            stroke: actions.stroke.then(|| self.state.stroke.clone()),
+            fill: actions.fill.then_some(self.state.fill),
+            fill_opacity: self.state.fill_opacity,
             fill_rule: self.state.fill_rule,
         };
-        for action in actions.split(',').map(str::trim) {
-            match action {
-                "stroke" | "draw" => style.stroke = Some(self.state.stroke.clone()),
-                "fill" => {
-                    style.fill = Some(self.state.fill);
-                    style.fill_opacity = self.state.fill_opacity;
-                }
-                "discard" | "" => {}
-                _ => return Err(format!("unsupported PGF path action {action:?}")),
+        let painted = actions.fill || actions.stroke;
+        if !actions.clip && !actions.bounding_box {
+            if !path.is_empty() {
+                self.place(Item::Path { path, style }, 0.)?;
             }
+            return Ok(());
         }
-        let contours = std::mem::take(&mut self.contours);
-        if !contours.is_empty() {
-            self.figure.push(Item::Path { contours, style });
+        if !path.is_finite() || path.is_empty() {
+            return Err("invalid clipping path".into());
+        }
+        let world = self.state.transform * path.as_ref();
+        if !world.is_finite() {
+            return Err("non-finite transformed clip".into());
+        }
+        let rect = rectangle(&world);
+        if actions.bounding_box {
+            if !actions.clip
+                || !self.figure.items.is_empty()
+                || self.figure.viewport.is_some()
+                || painted
+            {
+                return Err(
+                    "expected an initial rectangular bounding box and clip".into()
+                );
+            }
+            self.figure.viewport = Some(
+                rect.filter(|r| !r.is_zero_area())
+                    .ok_or("expected a rectangular viewport")?,
+            );
+            self.state.viewport_clip = true;
+        } else {
+            if painted {
+                self.place(Item::Path { path, style }, 0.)?;
+            }
+            if self.figure.viewport.is_none() && self.state.clips.is_empty() {
+                self.place(Item::Bounds(world.bounding_box()), 0.)?;
+            }
+            self.state.clips.push(Rc::new(Clip {
+                path: world,
+                rule: self.state.fill_rule,
+                rectangle: rect,
+            }));
         }
         Ok(())
     }
+
     fn command(&mut self, name: &str, args: &[Argument<'_>]) -> Result<()> {
         use Argument::{Optional as O, Required as R};
         match (name, args) {
             ("makeatletter" | "makeatother", []) => {}
             ("begin", [R(env @ ("pgfpicture" | "pgfscope"))]) => self.open(env)?,
             ("end", [R(env @ ("pgfpicture" | "pgfscope"))]) => self.close(env)?,
-            ("begingroup" | "pgfpicture" | "pgfscope", []) => self.open(name)?,
+            ("begingroup" | "pgfpicture" | "pgfscope" | "pgfsys@beginscope", []) => {
+                self.open(name)?
+            }
+            ("pgfsys@endscope", []) => self.close("pgfsys@beginscope")?,
             ("endgroup", []) => self.close("begingroup")?,
             ("endpgfpicture" | "endpgfscope", []) => self.close(&name[3..])?,
             ("definecolor", [R(key), R(model), R(spec)]) => {
@@ -763,64 +417,75 @@ impl Reader {
                     (!array.is_empty()).then_some(Dash { array, phase });
             }
             ("pgfsetlinewidth", [R(v)]) => self.state.stroke.width = dimension(v)?,
-            ("pgfsetstrokecolor", [R(v)]) => {
-                self.state.stroke.color = self.state.color(v)?
+            ("pgfsetmiterlimit", [R(v)]) => {
+                let miter = scalar(v)?;
+                if miter < 1. {
+                    return Err("expected a miter limit >= 1".into());
+                }
+                self.state.stroke.miter = miter;
             }
-            ("pgfsetfillcolor", [R(v)]) => self.state.fill = self.state.color(v)?,
+            ("pgfsetstrokecolor", [R(v)]) => {
+                self.state.stroke.color = resolve_color(Some(&self.state.colors), v)?;
+            }
+            ("pgfsetfillcolor", [R(v)]) => {
+                self.state.fill = resolve_color(Some(&self.state.colors), v)?;
+            }
             ("pgfsetcolor", [R(v)]) => {
-                self.state.fill = self.state.color(v)?;
+                self.state.fill = resolve_color(Some(&self.state.colors), v)?;
                 self.state.stroke.color = self.state.fill;
             }
-            ("pgfpathmoveto", [R(p)]) => self.contours.push(Contour::Curve {
-                start: point(p)?,
-                segments: vec![],
-                closed: false,
-            }),
-            ("pgfpathlineto", [R(p)]) => {
-                self.curve()?.0.push(Segment::Line { to: point(p)? })
+            ("pgfsys@transformshift", [R(x), R(y)]) => {
+                self.state.transform *= Affine::translate((dimension(x)?, dimension(y)?));
             }
-            ("pgfpathquadraticcurveto", [R(a), R(b)]) => self
-                .curve()?
-                .0
-                .push(Segment::Quadratic { control: point(a)?, to: point(b)? }),
-            ("pgfpathcurveto", [R(a), R(b), R(c)]) => {
-                self.curve()?.0.push(Segment::Cubic {
-                    first: point(a)?,
-                    second: point(b)?,
-                    to: point(c)?,
-                })
+            ("pgfsys@transformcm", [R(a), R(b), R(c), R(d), R(x), R(y)]) => {
+                self.state.transform *= Affine::new([
+                    scalar(a)?,
+                    scalar(b)?,
+                    scalar(c)?,
+                    scalar(d)?,
+                    dimension(x)?,
+                    dimension(y)?,
+                ]);
             }
-            ("pgfpathclose", []) => *self.curve()?.1 = true,
-            ("pgfpathrectangle" | "pgfpathrectanglecorners", [R(a), R(b)]) => {
-                let a = point(a)?;
-                let mut b = point(b)?;
-                if name == "pgfpathrectangle" {
-                    b = [a[0] + b[0], a[1] + b[1]];
+            ("pgfsys@defobject", [R(key), R(min), R(max), R(body)]) => {
+                point(min)?;
+                point(max)?;
+                if !key.chars().all(|c| c.is_alphanumeric() || "-_@".contains(c)) {
+                    return Err("dynamic object name".into());
                 }
-                let contour = if (a[0] > b[0]) != (a[1] > b[1]) {
-                    Contour::Curve {
-                        start: a,
-                        segments: vec![
-                            Segment::Line { to: [b[0], a[1]] },
-                            Segment::Line { to: b },
-                            Segment::Line { to: [a[0], b[1]] },
-                        ],
-                        closed: true,
-                    }
-                } else {
-                    Contour::rectangle(a, b)
-                };
-                self.contours.push(contour);
+                self.objects.insert(key.to_string(), object(body)?);
             }
-            ("pgfpathcircle", [R(p), R(r)]) => self
-                .contours
-                .push(Contour::Circle { center: point(p)?, radius: dimension(r)? }),
-            ("pgfusepath", [R(actions)]) => self.use_path(actions)?,
-            ("pgfcoordinate", [R(name), R(at)]) => self
-                .figure
-                .push(Item::Anchor { name: name.to_string(), at: point(at)? }),
-            ("pgftext", [R(text)]) => self.figure.push(label("", text)?),
-            ("pgftext", [O(opts), R(text)]) => self.figure.push(label(opts, text)?),
+            ("pgfsys@useobject", [R(key), R("")]) => {
+                let paths =
+                    self.objects.get(*key).cloned().ok_or("unknown static object")?;
+                let depth = self.state.clips.len();
+                for (path, actions) in paths.iter() {
+                    self.use_path(path.clone(), *actions)?;
+                }
+                self.state.clips.truncate(depth);
+            }
+            ("pgfusepath", [R(actions)]) => {
+                let path = std::mem::take(&mut self.path);
+                self.use_path(Rc::new(path), Actions::parse(actions)?)?;
+            }
+            ("pgfcoordinate", [R(name), R(at)]) => {
+                self.place(Item::Anchor { name: name.to_string(), at: point(at)? }, 0.)?;
+            }
+            ("pgftext", [options @ .., R(body)]) => {
+                let options = match options {
+                    [] => "",
+                    [O(s)] => s,
+                    _ => return Err("invalid PGF text options".into()),
+                };
+                let (item, angle) = labels::parse(
+                    options,
+                    body,
+                    Some(&self.state.colors),
+                    self.state.fill_opacity,
+                )?;
+                self.place(item, angle)?;
+            }
+            _ if path_command(&mut self.path, name, args)? => {}
             _ => return Err(format!("unsupported PGF command or arguments: \\{name}")),
         }
         Ok(())
@@ -833,6 +498,9 @@ pub fn read_with(
 ) -> Result<Figure> {
     let mut r = Reader {
         state: State {
+            transform: Affine::IDENTITY,
+            clips: Vec::new(),
+            viewport_clip: false,
             stroke: Stroke::black(0.4 * TEX_PT),
             fill: BLACK,
             fill_opacity: 1.,
@@ -840,15 +508,16 @@ pub fn read_with(
             colors: HashMap::new(),
         },
         scopes: vec![],
-        contours: vec![],
-        figure: vec![],
+        path: BezPath::new(),
+        objects: HashMap::new(),
+        figure: Figure::default(),
     };
     fn parse(
         r: &mut Reader,
         source: &str,
         inputs: &mut super::resources::Inputs,
     ) -> Result<()> {
-        let source = uncomment(source);
+        let source = labels::uncomment(source);
         let mut parser = Parser::new(&source);
         while let Some(event) = parser.next_event()? {
             match event {
@@ -875,7 +544,7 @@ pub fn read_with(
         Ok(())
     }
     parse(&mut r, source, resources)?;
-    if !r.scopes.is_empty() || !r.contours.is_empty() {
+    if !r.scopes.is_empty() || !r.path.elements().is_empty() {
         return Err("unfinished PGF scope or path".into());
     }
     Ok(r.figure)

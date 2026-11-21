@@ -17,6 +17,11 @@ crate-type = ["cdylib"]
 base64 = "0.22"
 panfig-image = { path = "image" }
 kurbo = "0.11.3"
+# keep the converter and the Typst scope in lib.typ on the same release.
+mitex = { git = "https://github.com/mitex-rs/mitex", tag = "0.2.7" }
+mitex-lexer = { git = "https://github.com/mitex-rs/mitex", tag = "0.2.7" }
+# the upstream prebuilt command table predates the Typst 0.15 symbol names.
+mitex-spec-gen = { git = "https://github.com/mitex-rs/mitex", tag = "0.2.7", features = ["generate"] }
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 svgtypes = "0.15"

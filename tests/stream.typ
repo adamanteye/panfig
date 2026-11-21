@@ -21,8 +21,8 @@
   assert(size.width > 30pt and size.height > 10pt)
 }
 
-#show curve: it => {
-  metadata("curve")
+#show image: it => {
+  metadata("svg")
   it
 }
 #show "峰值": it => {
@@ -30,4 +30,4 @@
   it
 }
 #from-file
-#context assert.eq(query(metadata).map(it => it.value), ("curve", "text"))
+#context assert.eq(query(metadata).map(it => it.value), ("svg", "text"))

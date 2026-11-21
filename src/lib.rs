@@ -1,6 +1,7 @@
 use panfig_image as image;
 
 mod drawing;
+mod labels;
 mod pgf;
 mod pgfcodec;
 mod render;
@@ -23,9 +24,9 @@ pub fn read_pgf(data: &[u8], files: &[u8]) -> Result<Vec<u8>, String> {
         serde_json::from_slice(files)
             .map_err(|e| format!("invalid resource table: {e}"))?,
     );
-    let result = pgfcodec::read_with(source(data)?, &mut inputs).and_then(|items| {
-        drawing::validate(&items)?;
-        render::layers(&items)
+    let result = pgfcodec::read_with(source(data)?, &mut inputs).and_then(|figure| {
+        drawing::validate(&figure)?;
+        render::layers(&figure)
     });
     if let Some(name) = inputs.need {
         return json(&serde_json::json!({ "input": name }));
@@ -50,7 +51,7 @@ pub fn read_svg(data: &[u8], host_labels: &[u8]) -> Result<Vec<u8>, String> {
 /// identify literal PGF labels for the host typesetter.
 #[cfg_attr(target_arch = "wasm32", wasm_minimal_protocol::wasm_func)]
 pub fn labels(data: &[u8], prefix: &[u8]) -> Result<Vec<u8>, String> {
-    pgfcodec::named_labels(source(data)?, source(prefix)?)
+    labels::named_labels(source(data)?, source(prefix)?)
 }
 
 /// transfer binary image resources without expanding them into JSON number arrays.
@@ -86,6 +87,99 @@ mod tests {
 
     fn events(source: &str) -> Value {
         serde_json::to_value(read_events(source).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn clips_marker_replays_in_paint_order() {
+        let source = br"\begin{pgfpicture}
+            \pgfsys@defobject{marker}{\pgfpointorigin}{\pgfqpoint{4bp}{4bp}}{
+                \pgfpathrectangle{\pgfpointorigin}{\pgfqpoint{4bp}{4bp}}\pgfusepath{fill}}
+            \begin{pgfscope}
+                \pgfpathcircle{\pgfpointorigin}{3bp}\pgfusepath{clip}
+                \pgfsys@transformshift{1bp}{2bp}
+                \pgfpathrectangle{\pgfpointorigin}{\pgfqpoint{2bp}{6bp}}\pgfusepath{clip}
+                \pgfsetfillcolor{red}\pgfsys@useobject{marker}{}
+            \end{pgfscope}
+            \pgftext{separator}
+            \pgfsetfillcolor{blue}\pgfsys@useobject{marker}{}
+            \end{pgfpicture}";
+        let doc: Value =
+            serde_json::from_slice(&super::read_pgf(source, b"{}").unwrap()).unwrap();
+        let layers = doc["layers"].as_array().unwrap();
+        let kinds: Vec<_> = layers.iter().map(|l| l["kind"].as_str().unwrap()).collect();
+        assert_eq!(kinds, ["bounds", "svg", "text", "svg"]);
+        assert_eq!(layers[1]["rect"], json!([1., -3., 2., 1.]));
+        let svg = roxmltree::Document::parse(layers[1]["svg"].as_str().unwrap()).unwrap();
+        let marker = svg
+            .descendants()
+            .find(|n| n.attribute("fill") == Some("#ff0000"))
+            .unwrap();
+        assert_eq!(
+            marker.parent_element().unwrap().attribute("transform"),
+            Some("matrix(1 0 0 1 1 -2)")
+        );
+        assert_eq!(
+            marker.ancestors().filter(|n| n.has_attribute("clip-path")).count(),
+            2
+        );
+        assert_eq!(layers[3]["rect"], json!([0., -4., 4., 4.]));
+        let svg2 =
+            roxmltree::Document::parse(layers[3]["svg"].as_str().unwrap()).unwrap();
+        assert!(svg2.descendants().any(|n| n.attribute("fill") == Some("#0000ff")));
+    }
+
+    #[test]
+    fn coalesces_identical_clips_across_scopes() {
+        let source = br"\begin{pgfpicture}
+            \pgfpathrectangle{\pgfpointorigin}{\pgfqpoint{20bp}{20bp}}\pgfusepath{use as bounding box,clip}
+            \begin{pgfscope}
+                \pgfpathrectangle{\pgfqpoint{2bp}{2bp}}{\pgfqpoint{10bp}{10bp}}\pgfusepath{clip}
+                \pgfsetmiterlimit{3}\pgfpathmoveto{\pgfpointorigin}\pgfpathlineto{\pgfqpoint{10bp}{10bp}}\pgfusepath{stroke}
+            \end{pgfscope}
+            \begin{pgfscope}
+                \pgfpathrectangle{\pgfqpoint{2bp}{2bp}}{\pgfqpoint{10bp}{10bp}}\pgfusepath{clip}
+                \definecolor{g}{gray}{0.5}\pgfsetstrokecolor{g}
+                \pgfpathmoveto{\pgfqpoint{0bp}{10bp}}\pgfpathlineto{\pgfqpoint{10bp}{0bp}}\pgfusepath{stroke}
+            \end{pgfscope}
+            \end{pgfpicture}";
+        let doc: Value =
+            serde_json::from_slice(&super::read_pgf(source, b"{}").unwrap()).unwrap();
+        assert_eq!(doc["viewport"], json!([0., -20., 20., 20.]));
+        let layers = doc["layers"].as_array().unwrap();
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0]["kind"], "svg");
+        let svg = roxmltree::Document::parse(layers[0]["svg"].as_str().unwrap()).unwrap();
+        let clips = svg.descendants().filter(|n| n.has_tag_name("clipPath")).count();
+        assert_eq!(clips, 1);
+        assert!(svg
+            .descendants()
+            .any(|n| n.attribute("stroke-miterlimit") == Some("3")));
+        assert!(svg.descendants().any(|n| n.attribute("stroke") == Some("#808080")));
+    }
+
+    #[test]
+    fn normalizes_math_bars_and_label_modifiers() {
+        let bare = super::texmath::to_typst(r"|\psi|^2 + \|\phi\|").unwrap();
+        assert!(bare.contains(r#"class("normal", bar.v)"#));
+        assert!(bare.contains(r#"class("normal", bar.v.double)"#));
+        let stretched = super::texmath::to_typst(r"\left|\frac{a}{b}\right|").unwrap();
+        assert!(stretched.starts_with("lr(|"));
+        assert!(!stretched.contains(r#"class("normal""#));
+        let sized = super::texmath::to_typst(r"\big| x \big|").unwrap();
+        assert!(!sized.contains(r#"class("normal""#));
+
+        let source = br"\begin{pgfpicture}
+            \pgfsetfillcolor{red}\pgfsetfillopacity{0.5}
+            \pgftext{\fontsize{10}{12}\bfseries\itshape\selectfont Hi}
+            \end{pgfpicture}";
+        let doc: Value =
+            serde_json::from_slice(&super::read_pgf(source, b"{}").unwrap()).unwrap();
+        let text = &doc["layers"][0];
+        assert_eq!(text["kind"], "text");
+        assert_eq!(text["opacity"], json!(0.5));
+        assert_eq!(text["runs"][0]["bold"], json!(true));
+        assert_eq!(text["runs"][0]["italic"], json!(true));
+        assert!(text["runs"][0].get("fill").is_none());
     }
 
     #[test]

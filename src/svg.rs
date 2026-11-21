@@ -1,7 +1,6 @@
-//! lift representable SVG elements while preserving the viewport and the paint order of SVG slices.
-use super::drawing::{Dash, FillRule, LineCap, LineJoin, Result, Stroke, Style};
-use super::render;
-use kurbo::{Affine, BezPath, Circle, Rect, Shape};
+//! lift representable SVG text while keeping geometry in paint-ordered SVG slices.
+use super::drawing::Result;
+use kurbo::{Affine, BezPath, Rect, Shape};
 use roxmltree::Node;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -59,16 +58,18 @@ impl<'a> Paint<'a> {
         self.props.get(key).copied().unwrap_or(default)
     }
 
-    fn apply(&mut self, node: Element<'a>, geometry: &[&str]) -> Option<()> {
+    fn apply(&mut self, node: Element<'a>, ignore: &[&str]) -> Option<()> {
         let mut property = |k: &'a str, v: &'a str| {
             match k {
-                "color" | "fill" | "fill-opacity" | "fill-rule" | "stroke"
-                | "stroke-width" | "stroke-linejoin" | "stroke-linecap"
-                | "stroke-miterlimit" | "stroke-opacity" | "stroke-dasharray"
-                | "stroke-dashoffset" | "font-family" | "font-size" | "font-weight"
-                | "font-style" | "text-anchor" | "space" => {
+                "color" | "fill" | "fill-opacity" | "stroke" | "font-family"
+                | "font-size" | "font-weight" | "font-style" | "text-anchor"
+                | "space" => {
                     self.props.insert(k, v);
                 }
+                // benign geometry stroke/fill hints on ancestor groups do not prevent lifting text.
+                "fill-rule" | "stroke-width" | "stroke-linejoin" | "stroke-linecap"
+                | "stroke-miterlimit" | "stroke-opacity" | "stroke-dasharray"
+                | "stroke-dashoffset" => {}
                 _ => return None,
             }
             Some(())
@@ -90,7 +91,7 @@ impl<'a> Paint<'a> {
                     let t: Transform = a.value().parse().ok()?;
                     self.matrix *= Affine::new([t.a, t.b, t.c, t.d, t.e, t.f]);
                 }
-                k if geometry.contains(&k) => (),
+                k if ignore.contains(&k) => (),
                 k => property(k, a.value())?,
             }
         }
@@ -112,137 +113,6 @@ impl<'a> Paint<'a> {
             .parse()
             .ok()
     }
-
-    fn style(&self) -> Option<Style> {
-        let alpha = |key| number(self.get(key, "1")).map(|v| v.clamp(0., 1.));
-        let mut fill_opacity = alpha("fill-opacity")?;
-        let fill = if self.get("fill", "black") == "none" {
-            None
-        } else {
-            let c = self.color("fill", "black")?;
-            fill_opacity *= f64::from(c.alpha) / 255.;
-            Some([c.red, c.green, c.blue])
-        };
-        let stroke = if self.get("stroke", "none") == "none" {
-            None
-        } else {
-            let scale = uniform_scale(self.matrix)?;
-            let c = self.color("stroke", "none")?;
-            let width = length(self.get("stroke-width", "1"))? * scale;
-            if width < 0. {
-                return None;
-            }
-            let mut s = Stroke::black(width);
-            s.color = [c.red, c.green, c.blue];
-            s.opacity = alpha("stroke-opacity")? * f64::from(c.alpha) / 255.;
-            s.cap = match self.get("stroke-linecap", "butt") {
-                "butt" => LineCap::Butt,
-                "round" => LineCap::Round,
-                "square" => LineCap::Square,
-                _ => return None,
-            };
-            s.join = match self.get("stroke-linejoin", "miter") {
-                "miter" => LineJoin::Miter,
-                "round" => LineJoin::Round,
-                "bevel" => LineJoin::Bevel,
-                _ => return None,
-            };
-            s.miter = number(self.get("stroke-miterlimit", "4"))?;
-            if s.miter < 1. {
-                return None;
-            }
-            if self.get("stroke-dasharray", "none") != "none" {
-                let array = self
-                    .get("stroke-dasharray", "")
-                    .split(|c: char| c.is_whitespace() || c == ',')
-                    .filter(|v| !v.is_empty())
-                    .map(|v| length(v).map(|n| n * scale))
-                    .collect::<Option<Vec<_>>>()?;
-                if array.is_empty() || array.iter().any(|n| *n < 0.) {
-                    return None;
-                }
-                if array.iter().any(|n| *n > 0.) {
-                    s.dash = Some(Dash {
-                        array,
-                        phase: length(self.get("stroke-dashoffset", "0"))? * scale,
-                    });
-                }
-            }
-            Some(s)
-        };
-        let fill_rule = match self.get("fill-rule", "nonzero") {
-            "evenodd" => FillRule::EvenOdd,
-            "nonzero" => FillRule::NonZero,
-            _ => return None,
-        };
-        Some(Style { fill, stroke, fill_rule, fill_opacity })
-    }
-}
-
-fn uniform_scale(matrix: Affine) -> Option<f64> {
-    let [a, b, c, d, _, _] = matrix.as_coeffs();
-    let scale = a.hypot(b);
-    (scale > 0.
-        && (scale - c.hypot(d)).abs() < scale * 1e-8
-        && (a * c + b * d).abs() < scale * scale * 1e-8)
-        .then_some(scale)
-}
-
-fn geometry<'a>(n: Element<'a>, mut paint: Paint<'a>) -> Option<Value> {
-    let dim = |key| length(n.attribute(key).unwrap_or("0"));
-    let path = match n.tag_name().name() {
-        "path" => {
-            paint.apply(n, &["d"])?;
-            let mut p = BezPath::new();
-            for el in svgtypes::SimplifyingPathParser::from(n.attribute("d")?) {
-                use svgtypes::SimplePathSegment::*;
-                match el.ok()? {
-                    MoveTo { x, y } => p.move_to((x, y)),
-                    LineTo { x, y } => p.line_to((x, y)),
-                    Quadratic { x1, y1, x, y } => p.quad_to((x1, y1), (x, y)),
-                    CurveTo { x1, y1, x2, y2, x, y } => {
-                        p.curve_to((x1, y1), (x2, y2), (x, y))
-                    }
-                    ClosePath => p.close_path(),
-                }
-                if p.elements().len() > render::NATIVE_SEGMENTS {
-                    return None;
-                }
-            }
-            p
-        }
-        "line" => {
-            paint.apply(n, &["x1", "y1", "x2", "y2"])?;
-            let mut p = BezPath::new();
-            p.move_to((dim("x1")?, dim("y1")?));
-            p.line_to((dim("x2")?, dim("y2")?));
-            p
-        }
-        "rect" => {
-            paint.apply(n, &["x", "y", "width", "height"])?;
-            let (x, y, w, h) = (dim("x")?, dim("y")?, dim("width")?, dim("height")?);
-            if w <= 0. || h <= 0. {
-                return None;
-            }
-            Rect::new(x, y, x + w, y + h).to_path(0.001)
-        }
-        "circle" => {
-            paint.apply(n, &["cx", "cy", "r"])?;
-            let r = dim("r")?;
-            if r <= 0. {
-                return None;
-            }
-            Circle::new((dim("cx")?, dim("cy")?), r).to_path(0.001)
-        }
-        _ => return None,
-    };
-    if n.children().any(|n| n.is_element())
-        || path.is_empty()
-        || path.elements().len() > render::NATIVE_SEGMENTS
-    {
-        return None;
-    }
-    Some(render::native(&(paint.matrix * path), &paint.style()?))
 }
 
 fn text_layer<'a>(n: Element<'a>, mut paint: Paint<'a>, tex: bool) -> Option<Value> {
@@ -282,7 +152,7 @@ fn text_layer<'a>(n: Element<'a>, mut paint: Paint<'a>, tex: bool) -> Option<Val
     let sy = sy.copysign(a * d - b * c);
     let angle = b.atan2(a).to_degrees();
     let pt = paint.matrix * kurbo::Point::new(x, y);
-    let at = [pt.x, -pt.y];
+    let at = [pt.x, pt.y];
     let c = paint.color("fill", "black")?;
     let alpha =
         f64::from(c.alpha) * number(paint.get("fill-opacity", "1"))?.clamp(0., 1.);
@@ -290,9 +160,14 @@ fn text_layer<'a>(n: Element<'a>, mut paint: Paint<'a>, tex: bool) -> Option<Val
     if let Some(id) = marker {
         // TeX rounds image sizes to scaled points before emitting the placement.
         let snap = |s: f64| if (s - 1.).abs() < 0.001 { 1. } else { s };
-        return Some(
-            json!({"kind":"host-text","id":id,"at":at,"color":color,"scale":[snap(sx),snap(sy)],"angle":angle}),
-        );
+        return Some(json!({
+            "kind": "host-text",
+            "id": id,
+            "at": at,
+            "color": color,
+            "scale": [snap(sx), snap(sy)],
+            "angle": angle,
+        }));
     }
     let n = span.unwrap_or(n);
     if n.children().any(|n| n.is_element()) {
@@ -333,9 +208,20 @@ fn text_layer<'a>(n: Element<'a>, mut paint: Paint<'a>, tex: bool) -> Option<Val
             .map(|s| s.trim().trim_matches(['\'', '"']))
             .collect::<Vec<_>>()
     });
-    Some(
-        json!({"kind":"text","at":at,"anchor":anchor,"scale":[1.,sy/sx],"angle":angle,"runs":[{"text":text,"bold":bold,"italic":italic,"fill":color}],"size":size,"font":font}),
-    )
+    Some(json!({
+        "kind": "text",
+        "at": at,
+        "anchor": anchor,
+        "scale": [1., sy / sx],
+        "angle": angle,
+        "runs": [{"text": text, "bold": bold, "italic": italic, "fill": color}],
+        "size": size,
+        "font": font,
+    }))
+}
+
+fn has_text(n: Element) -> bool {
+    n.descendants().any(|d| d.is_element() && d.has_tag_name("text"))
 }
 
 fn is_viewport_clip(n: Element, matrix: Affine, size: [f64; 2]) -> bool {
@@ -401,7 +287,7 @@ fn is_viewport_clip(n: Element, matrix: Affine, size: [f64; 2]) -> bool {
     (4..=5).contains(&count)
 }
 
-// consecutive fallback elements share ancestor wrappers and the original definitions.
+// consecutive SVG elements share ancestor wrappers and the original definitions.
 struct Slices<'a> {
     source: &'a str,
     root: Element<'a>,
@@ -410,7 +296,7 @@ struct Slices<'a> {
     groups: Vec<Element<'a>>,
     body: String,
     layers: Vec<Value>,
-    size: [f64; 2],
+    rect: [f64; 4],
 }
 
 impl<'a> Slices<'a> {
@@ -436,7 +322,7 @@ impl<'a> Slices<'a> {
         let root = opening(self.source, self.root);
         let svg = format!("{}{}{}{}", root, self.defs, self.body, closing(root));
         self.layers
-            .push(json!({"kind":"vector","at":[0.,0.],"size":self.size,"svg":svg}));
+            .push(json!({"kind": "svg", "rect": self.rect, "svg": svg}));
         self.body.clear();
     }
     fn walk(
@@ -444,12 +330,11 @@ impl<'a> Slices<'a> {
         n: Element<'a>,
         groups: &mut Vec<Element<'a>>,
         paint: &Paint<'a>,
-        dense: bool,
         tex: bool,
     ) {
         if n.has_tag_name("clipPath") {
             if let Some(id) = n.attribute("id") {
-                if is_viewport_clip(n, paint.matrix, self.size) {
+                if is_viewport_clip(n, paint.matrix, [self.rect[2], self.rect[3]]) {
                     self.viewport_clips.insert(id);
                 }
             }
@@ -462,6 +347,10 @@ impl<'a> Slices<'a> {
             }
             return;
         }
+        if !has_text(n) {
+            self.fallback(groups, n);
+            return;
+        }
         if n.has_tag_name("g") && groups.len() < 128 {
             let mut next = paint.clone();
             let skip_clip = n
@@ -472,25 +361,20 @@ impl<'a> Slices<'a> {
             if next.apply(n, ignore).is_some() {
                 groups.push(n);
                 for child in n.children().filter(Node::is_element) {
-                    self.walk(child, groups, &next, dense, tex);
+                    self.walk(child, groups, &next, tex);
                 }
                 groups.pop();
                 return;
             }
         }
-        let native = if n.has_tag_name("text") {
-            text_layer(n, paint.clone(), tex)
-        } else if dense {
-            None
-        } else {
-            geometry(n, paint.clone())
-        };
-        if let Some(layer) = native {
-            self.flush();
-            self.layers.push(layer);
-        } else {
-            self.fallback(groups, n);
+        if n.has_tag_name("text") {
+            if let Some(layer) = text_layer(n, paint.clone(), tex) {
+                self.flush();
+                self.layers.push(layer);
+                return;
+            }
         }
+        self.fallback(groups, n);
     }
 }
 
@@ -520,12 +404,16 @@ pub fn read(source: &str, tex: bool) -> Result<Vec<u8>> {
     if ![w, h].iter().all(|v| v.is_finite() && *v > 0.) {
         return Err("invalid intrinsic dimensions for SVG".into());
     }
-    let size = [w, h];
+    let viewport = [0., 0., w, h];
     let whole = || {
-        super::json(
-            &json!({"size":size,"layers":[{"kind":"vector","at":[0,0],"size":size,"svg":source}]}),
-        )
+        super::json(&json!({
+            "viewport": viewport,
+            "layers": [{"kind": "svg", "rect": viewport, "svg": source}],
+        }))
     };
+    if !has_text(root) {
+        return whole();
+    }
     let mut paint = Paint::default();
     // preserve global CSS, entity declarations and references to painted elements as one SVG.
     let defs: Vec<_> = root.children().filter(|n| n.has_tag_name("defs")).collect();
@@ -534,11 +422,7 @@ pub fn read(source: &str, tex: bool) -> Result<Vec<u8>> {
         .flat_map(|d| d.descendants())
         .filter_map(|n| n.attribute("id"))
         .collect();
-    let mut count = 0;
     for n in root.descendants().filter(Node::is_element) {
-        if matches!(n.tag_name().name(), "path" | "line" | "rect" | "circle") {
-            count += 1
-        }
         if (matches!(
             n.tag_name().name(),
             "mask"
@@ -572,7 +456,7 @@ pub fn read(source: &str, tex: bool) -> Result<Vec<u8>> {
     {
         return whole();
     }
-    let matrix = if let Some(v) = vb {
+    paint.matrix = if let Some(v) = vb {
         let (sx, sy) = (w / v.w, h / v.h);
         let align = root.attribute("preserveAspectRatio").unwrap_or("xMidYMid meet");
         let (sx, sy) = match align.trim() {
@@ -591,11 +475,10 @@ pub fn read(source: &str, tex: bool) -> Result<Vec<u8>> {
     } else {
         Affine::scale(0.75)
     };
-    paint.matrix = matrix;
     let mut slices = Slices {
         source,
         root,
-        size,
+        rect: viewport,
         defs: defs.iter().map(|d| &source[d.range()]).collect(),
         viewport_clips: HashSet::new(),
         groups: Vec::new(),
@@ -606,9 +489,9 @@ pub fn read(source: &str, tex: bool) -> Result<Vec<u8>> {
         if n.tag_name().namespace() == root.tag_name().namespace()
             && !matches!(n.tag_name().name(), "defs" | "metadata" | "title" | "desc")
         {
-            slices.walk(n, &mut Vec::new(), &paint, count > render::NATIVE_PATHS, tex);
+            slices.walk(n, &mut Vec::new(), &paint, tex);
         }
     }
     slices.flush();
-    super::json(&json!({"size":size,"layers":slices.layers}))
+    super::json(&json!({"viewport": viewport, "layers": slices.layers}))
 }

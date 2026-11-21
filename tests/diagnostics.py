@@ -1,5 +1,6 @@
 """exercise resource resolution and diagnostics through the public Typst package."""
 
+import json
 from pathlib import Path
 from subprocess import run
 from tempfile import TemporaryDirectory
@@ -11,6 +12,21 @@ def main():
     with TemporaryDirectory(dir=ROOT / "target") as work:
         directory = Path(work)
         entry = directory / "main.typ"
+        # compile the Matplotlib example through its caller-relative resource resolver.
+        deps = directory / "deps.json"
+        run(
+            [
+                "typst", "compile", "--root", ROOT, "--deps", deps,
+                ROOT / "examples/hydrogen.typ", directory / "hydrogen.pdf",
+            ],
+            cwd=ROOT,
+            check=True,
+        )
+        inputs = {(ROOT / p).resolve() for p in json.loads(deps.read_text())["inputs"]}
+        assert {ROOT / f"examples/hydrogen-img{i}.png" for i in range(4)} <= inputs
+        assert ROOT / "runtime" / "panfig.wasm" in inputs
+        assert ROOT / "runtime" / "latex.wasm" not in inputs
+
         source = directory / "input.cetz"
         source.write_text("let x = 1")
         cases = [

@@ -1,5 +1,9 @@
 use serde::Serialize;
 
+// Matplotlib changes the catcodes of ^ and % locally inside its label group.
+pub(super) const MPL_CATCODES: &str =
+    r"\catcode`\^=\active\def^{\ifmmode\sp\else\^{}\fi}\catcode`\%=\active\def%{\%}";
+
 #[derive(Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum Event<'a> {
@@ -25,7 +29,7 @@ fn required_args(name: &str) -> usize {
         | "pgfseteorule" | "pgfsetnonzerorule" | "pgfpointorigin" | "pgfpicture"
         | "endpgfpicture" | "pgfscope" | "endpgfscope" | "pgfsetbuttcap"
         | "pgfsetroundcap" | "pgfsetrectcap" | "pgfsetmiterjoin" | "pgfsetroundjoin"
-        | "pgfsetbeveljoin" => 0,
+        | "pgfsetbeveljoin" | "pgfsys@beginscope" | "pgfsys@endscope" => 0,
         "begin"
         | "input"
         | "includegraphics"
@@ -36,13 +40,16 @@ fn required_args(name: &str) -> usize {
         | "pgfusepath"
         | "pgftext"
         | "pgfsetlinewidth"
+        | "pgfsetmiterlimit"
         | "pgfsetcolor"
         | "pgfsetfillcolor"
         | "pgfsetstrokecolor"
         | "pgfsetfillopacity"
         | "pgfsetstrokeopacity"
         | "pgftransformshift" => 1,
-        "pgfcoordinate"
+        "pgfsys@transformshift"
+        | "pgfsys@useobject"
+        | "pgfcoordinate"
         | "pgfpointanchor"
         | "pgfpointadd"
         | "pgfpoint"
@@ -53,6 +60,8 @@ fn required_args(name: &str) -> usize {
         | "pgfpathcircle"
         | "pgfsetdash" => 2,
         "definecolor" | "pgfpathcurveto" | "pgfpatharc" | "pgfpathellipse" => 3,
+        "pgfsys@defobject" => 4,
+        "pgfsys@transformcm" => 6,
         _ => usize::MAX,
     }
 }
@@ -140,19 +149,33 @@ impl<'a> Parser<'a> {
         self.bump();
         let start = self.pos;
         let mut braces = 0;
-        while let Some(c) = self.bump() {
+        let mut active_percent = None;
+        // only ASCII delimiters affect grouping. Keep offsets in the original UTF-8.
+        let bytes = self.source.as_bytes();
+        while let Some(&c) = bytes.get(self.pos) {
+            self.pos += 1;
             match c {
-                '\\' => {
-                    self.control_name()?;
+                b'\\' if bytes[self.pos..].starts_with(&MPL_CATCODES.as_bytes()[1..]) => {
+                    self.pos += MPL_CATCODES.len() - 1;
+                    active_percent = Some(braces);
                 }
-                '%' => self.skip_comment(),
-                '{' => braces += 1,
-                '}' if braces > 0 => braces -= 1,
-                '}' if optional => {
+                b'\\' if self.pos == bytes.len() => {
+                    return Err(self.error(self.pos - 1, "dangling backslash"))
+                }
+                b'\\' => self.pos += 1,
+                b'%' if active_percent.is_none() => self.skip_comment(),
+                b'{' => braces += 1,
+                b'}' if braces > 0 => {
+                    if active_percent == Some(braces) {
+                        active_percent = None;
+                    }
+                    braces -= 1;
+                }
+                b'}' if optional => {
                     return Err(self.error(self.pos - 1, "unexpected } inside option"))
                 }
-                '}' => return Ok(Argument::Required(&self.source[start..self.pos - 1])),
-                ']' if optional && braces == 0 => {
+                b'}' => return Ok(Argument::Required(&self.source[start..self.pos - 1])),
+                b']' if optional && braces == 0 => {
                     return Ok(Argument::Optional(&self.source[start..self.pos - 1]));
                 }
                 _ => {}

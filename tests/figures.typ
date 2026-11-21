@@ -30,13 +30,6 @@
   metadata("native text")
   it
 }
-#show curve: it => {
-  for c in it.components.filter(c => c.func() == curve.close) {
-    assert.eq(c.mode, "straight")
-  }
-  metadata("curve")
-  it
-}
 #show image: it => {
   metadata("image")
   it
@@ -93,14 +86,15 @@
   assert.eq(kinds, (
     "native text",
     "image",
-    "curve",
     "svg replacement",
     "image",
     "native text",
-    "curve",
+    "image",
     "native text",
     "image",
     "native text",
+    "lifted math",
+    "lifted math",
     "lifted math",
     "lifted math",
   ))
@@ -149,12 +143,55 @@
   assert(calc.abs(measure(panfig(tick)).width - w) < 0.01pt)
 }
 
-// recursive LaTeX math lifting on both fast and TeX+clip paths without bundled fonts.
+// keep math native inside the full-picture clip.
 #{
   show math.equation: it => {
     metadata("lifted math")
     it
   }
   panfig(pgf("\\pgftext{$P_{4\\ell}(r) = r^2 |R_{4\\ell}(r)|^2$}"))
-  panfig(pgf("\\pgfpathrectangle{\\pgfpointorigin}{\\pgfqpoint{80bp}{40bp}}\\pgfusepath{use as bounding box, clip}\\pgftext[at={\\pgfqpoint{40bp}{20bp}},rotate=90]{$x / a_0$}"))
+  panfig(pgf("\\pgftext{$\\|\\psi\\| + \\left|\\frac{a}{b}\\right| + \\big|x\\big|$}"))
+  let clipped = pgf("\\pgfpathrectangle{\\pgfpointorigin}{\\pgfqpoint{80bp}{40bp}}\\pgfusepath{use as bounding box, clip}\\pgftext[at={\\pgfqpoint{40bp}{20bp}},rotate=90]{$x / a_0$}")
+  for preamble in ("", "% force TeX") { panfig(clipped, preamble: preamble) }
+}
+
+#context {
+  let picture(body) = measure(panfig(pgf(body), load: resources))
+  let stamp = "\\pgftext[left,bottom]{\\includegraphics[width=4bp,height=2bp]{icon.svg}}"
+  let rect = "\\pgfpathrectangle{\\pgfqpoint{3bp}{6bp}}{\\pgfqpoint{5bp}{7bp}}"
+  assert.eq(picture(rect + "\\pgfusepath{use as bounding box,clip}" + stamp),
+    (width: 5pt, height: 7pt))
+  assert.eq(picture("\\begin{pgfscope}" + rect + "\\pgfusepath{clip}" + stamp
+    + "\\end{pgfscope}" + stamp), (width: 8pt, height: 13pt))
+  assert.eq(picture("\\makeatletter\\pgfsys@transformcm{2}{0}{1}{3}{0bp}{0bp}\\makeatother" + stamp),
+    (width: 10pt, height: 6pt))
+  assert.eq(picture("\\pgfpathcircle{\\pgfqpoint{2bp}{1bp}}{1bp}\\pgfusepath{clip}" + stamp),
+    (width: 2pt, height: 2pt))
+  let rotated = picture(stamp.replace("left,bottom", "left,bottom,rotate=90"))
+  assert(calc.abs(rotated.width - 2pt) < 0.001pt and calc.abs(rotated.height - 4pt) < 0.001pt)
+
+  let marker = ("\\makeatletter\\pgfsys@defobject{marker}{\\pgfpointorigin}{\\pgfqpoint{1bp}{1bp}}{"
+    + "\\pgfpathrectangle{\\pgfpointorigin}{\\pgfqpoint{1bp}{1bp}}\\pgfusepath{fill}}")
+  let paint = "\\pgfsys@useobject{marker}{}"
+  let repeated = (marker + "\\begin{pgfscope}\\pgfsys@transformshift{10bp}{-8bp}" + paint
+    + "\\end{pgfscope}" + paint + "\\makeatother")
+  assert.eq(picture(repeated), (width: 11pt, height: 9pt))
+
+  let percent = tick.text.replace("120}}", "120%}}")
+  let expected = measure(text(size: (12 * 72 / 72.27) * 1pt, "120%"))
+  assert(calc.abs(measure(panfig(percent)).width - expected.width) < 0.01pt)
+
+  let styled = pgf(
+    "\\definecolor{g}{gray}{0.5}\\pgfsetmiterlimit{3}\\pgfsetfillcolor{g}\\pgfsetfillopacity{0.5}"
+      + "\\pgftext{\\fontsize{10}{12}\\bfseries\\itshape\\selectfont Hi}",
+  )
+  assert(measure(panfig(styled)).width > 0pt)
+
+  // binding resolve once must keep working for filenames, paths, raw blocks and inline strings.
+  let bound = panfig.with(resolve: p => path(p))
+  let expected-fig = measure(panfig("figure.pgf"))
+  assert.eq(measure(bound("figure.pgf")), expected-fig)
+  assert.eq(measure(bound(path("figure.pgf"))), expected-fig)
+  assert.eq(measure(bound(spectrum)), measure(panfig(spectrum)))
+  assert.eq(measure(bound(pgf("\\pgftext{Hi}"))), measure(panfig(pgf("\\pgftext{Hi}"))))
 }

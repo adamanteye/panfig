@@ -1,8 +1,35 @@
+use kurbo::{Affine, BezPath, Rect};
 use serde::Serialize;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 pub type Result<T> = std::result::Result<T, String>;
-pub type Figure = Vec<Item>;
+
+#[derive(Default)]
+pub struct Figure {
+    pub items: Vec<Placed>,
+    pub viewport: Option<Rect>,
+}
+
+pub struct Placed {
+    pub item: Item,
+    pub transform: Affine,
+    pub angle: f64,
+    pub clips: Vec<Rc<Clip>>,
+}
+
+pub struct Clip {
+    pub path: BezPath,
+    pub rule: FillRule,
+    pub rectangle: Option<Rect>,
+}
+
+impl PartialEq for Clip {
+    fn eq(&self, other: &Self) -> bool {
+        self.rule == other.rule && self.path.elements() == other.path.elements()
+    }
+}
+
 /// absolute Cartesian coordinates in printer's points (1/72 inch), y up.
 pub type Point = [f64; 2];
 pub type Color = [u8; 3];
@@ -13,9 +40,10 @@ pub const BLACK: Color = [0; 3];
 #[derive(Debug, PartialEq)]
 pub enum Item {
     Path {
-        contours: Vec<Contour>,
+        path: Rc<BezPath>,
         style: Style,
     },
+    Bounds(Rect),
     Anchor {
         name: String,
         at: Point,
@@ -24,6 +52,7 @@ pub enum Item {
         at: Position,
         anchor: String,
         runs: Vec<Run>,
+        opacity: f64,
         font: Option<String>,
         size: Option<f64>,
     },
@@ -57,48 +86,22 @@ impl Position {
     }
 }
 
-#[derive(Debug, PartialEq)]
-pub enum Contour {
-    Curve { start: Point, segments: Vec<Segment>, closed: bool },
-    Rectangle { a: Point, b: Point },
-    Circle { center: Point, radius: f64 },
-}
-
-impl Contour {
-    pub fn rectangle(a: Point, b: Point) -> Self {
-        Self::Rectangle {
-            a: [a[0].min(b[0]), a[1].min(b[1])],
-            b: [a[0].max(b[0]), a[1].max(b[1])],
-        }
-    }
-}
-
-#[derive(Debug, PartialEq)]
-pub enum Segment {
-    Line { to: Point },
-    Quadratic { control: Point, to: Point },
-    Cubic { first: Point, second: Point, to: Point },
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Style {
     pub stroke: Option<Stroke>,
     pub fill: Option<Color>,
-    #[serde(rename = "fill-opacity")]
     pub fill_opacity: f64,
-    #[serde(rename = "fill-rule")]
     pub fill_rule: FillRule,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
-#[serde(rename_all = "kebab-case")]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum FillRule {
     #[default]
     NonZero,
     EvenOdd,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Stroke {
     pub color: Color,
     pub width: f64,
@@ -106,26 +109,23 @@ pub struct Stroke {
     pub cap: LineCap,
     pub join: LineJoin,
     pub miter: f64,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub dash: Option<Dash>,
 }
-#[derive(Clone, Copy, Default, Debug, PartialEq, Serialize)]
-#[serde(rename_all = "kebab-case")]
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
 pub enum LineCap {
     #[default]
     Butt,
     Round,
     Square,
 }
-#[derive(Clone, Copy, Default, Debug, PartialEq, Serialize)]
-#[serde(rename_all = "kebab-case")]
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
 pub enum LineJoin {
     #[default]
     Miter,
     Round,
     Bevel,
 }
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Dash {
     pub array: Vec<f64>,
     pub phase: f64,
@@ -217,13 +217,15 @@ pub fn parse_hex(value: &str) -> Result<Color> {
     Err(format!("expected six RGB hex digits, got {value:?}"))
 }
 
-pub fn validate(items: &[Item]) -> Result<()> {
+pub fn validate(figure: &Figure) -> Result<()> {
     let point = |p: &Point| p.iter().all(|n| n.is_finite());
     let mut anchors = HashMap::new();
-    for (i, item) in items.iter().enumerate() {
-        let ok = match item {
-            Item::Path { contours, style } => {
-                !contours.is_empty()
+    for (i, placed) in figure.items.iter().enumerate() {
+        let ok = match &placed.item {
+            Item::Bounds(rect) => rect.is_finite(),
+            Item::Path { path, style } => {
+                !path.is_empty()
+                    && path.is_finite()
                     && (0.0..=1.).contains(&style.fill_opacity)
                     && style.stroke.as_ref().is_none_or(|s| {
                         s.width.is_finite()
@@ -234,27 +236,6 @@ pub fn validate(items: &[Item]) -> Result<()> {
                                     && d.array.iter().all(|v| v.is_finite() && *v >= 0.)
                                     && d.array.iter().any(|v| *v > 0.)
                             })
-                    })
-                    && contours.iter().all(|c| match c {
-                        Contour::Curve { start, segments, .. } => {
-                            point(start)
-                                && !segments.is_empty()
-                                && segments.iter().all(|s| match s {
-                                    Segment::Line { to } => point(to),
-                                    Segment::Quadratic { control, to } => {
-                                        point(control) && point(to)
-                                    }
-                                    Segment::Cubic { first, second, to } => {
-                                        point(first) && point(second) && point(to)
-                                    }
-                                })
-                        }
-                        Contour::Circle { center, radius } => {
-                            point(center) && radius.is_finite() && *radius > 0.
-                        }
-                        Contour::Rectangle { a, b } => {
-                            point(a) && point(b) && a[0] <= b[0] && a[1] <= b[1]
-                        }
                     })
             }
             Item::Anchor { name, at } => {
@@ -272,7 +253,7 @@ pub fn validate(items: &[Item]) -> Result<()> {
                     && !file.chars().any(|c| c.is_control() || "{}%\\".contains(c))
                     && width.iter().chain(height).all(|n| n.is_finite() && *n > 0.)
             }
-            Item::Text { at, anchor, runs, font, size } => {
+            Item::Text { at, anchor, runs, font, size, .. } => {
                 point(&at.resolve(&anchors)?)
                     && ANCHORS.contains(&anchor.as_str())
                     && size.is_none_or(|n| n.is_finite() && n > 0.)
@@ -289,7 +270,7 @@ pub fn validate(items: &[Item]) -> Result<()> {
                     })
             }
         };
-        if !ok {
+        if !ok || !placed.transform.is_finite() || !placed.angle.is_finite() {
             return Err(format!(
                 "invalid geometry, style or label in PGF item {}",
                 i + 1

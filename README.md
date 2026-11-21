@@ -1,10 +1,11 @@
 # panfig
 
-Import PGF, TikZ, Matplotlib PGF, and SVG figures as native Typst content.
+Import PGF, TikZ, Matplotlib PGF, and SVG figures into Typst with native text
+and math.
 
-Where possible, paths and labels are turned into Typst `curve` and `text`
-elements so figures pick up your document font and work with normal `set` and
-`show` rules. Anything that cannot be lowered directly stays in SVG layers, and
+Labels and inline math are lifted into native Typst `text` and `math.equation`
+elements so figures inherit your document fonts and work with normal `set` and
+`show` rules. Vector geometry is coalesced into paint-ordered SVG layers, and
 PGF/TikZ code that needs TeX runs in a bundled WebAssembly e-TeX engine.
 
 Requires Typst 0.15+.
@@ -13,6 +14,23 @@ Requires Typst 0.15+.
 
 ```typst
 #import "lib.typ": panfig
+
+#figure(
+  panfig("examples/hydrogen.pgf"),
+  caption: [Hydrogen atom wavefunction probability densities],
+)
+```
+
+Self-contained figures work without extra options, even across package or
+subdirectory boundaries. When a figure references external files (such as
+Matplotlib's `\includegraphics` images or `\input`) across package or directory
+boundaries, Typst cannot resolve sibling paths from inside a library; thus
+panfig has to bind `resolve` once at the top of your document (or pass it on
+that call):
+
+```typst
+#import "lib.typ": panfig
+#let panfig = panfig.with(resolve: p => path(p))
 
 #figure(
   panfig("examples/hydrogen.pgf"),
@@ -52,13 +70,13 @@ panfig(
 - `source`: a caller-relative filename, Typst `path`, raw block, source string, or `bytes`.
 - `format`: `auto` (default), `"pgf"` (aliases: `"tikz"`, `"tex"`, `"latex"`), or `"svg"`.
 - `preamble`: extra LaTeX preamble lines for TeX-compiled figures.
-- `resolve`: pass `resolve: p => path(p)` at the call site when importing a file that references other files via `\input` or `\includegraphics` across package/project boundaries.
+- `resolve`: optional caller-site path resolver (`resolve: p => path(p)`). Not needed for self-contained figures; bind `#let panfig = panfig.with(resolve: p => path(p))` when importing figures that reference external files via `\input` or `\includegraphics` across package or directory boundaries.
 - `load`: a dictionary or function supplying referenced files (for example `load: ("plot.jpg": path("figures/plot.jpg"))`). Required for extensionless or optional images in TeX.
 
 ## Notes
 
-- **PGF and TikZ**: Simple drawing commands and inline math are parsed directly without invoking TeX. Full TikZ, macros, and complex layouts run in the bundled e-TeX/PGF engine, which ships a fixed LaTeX2e 2020 macro environment (`amsmath`, PGF, and `mhchem` v3.11) without bundled fonts. Supported text and math are lifted into Typst and rendered with your document/system fonts; missing fonts produce a Typst warning. XeTeX/LuaTeX primitives and PDF/PostScript-only specials are not supported.
-- **SVG**: Expects a self-contained SVG (with embedded raster images). Arbitrary clipping paths, group opacity, gradients, skewed text, and very dense path batches are kept as SVG layers in their original paint order and viewport. Text already converted to outlines stays geometry.
+- **PGF and TikZ**: The Rust reader handles static Matplotlib paths, clipping, affine transforms, marker reuse, and text with inline math, coalescing geometry into paint-ordered SVG layers while lifting labels into Typst. Linked images load through the same caller-relative resolver as the figure. Full TikZ, macros, and complex layouts run in the bundled e-TeX/PGF engine, which ships a fixed LaTeX2e 2020 macro environment (`amsmath`, PGF, and `mhchem` v3.11) without bundled fonts. Supported text and math are lifted into Typst and rendered with your document/system fonts; missing fonts produce a Typst warning. XeTeX/LuaTeX primitives and PDF/PostScript-only specials are not supported.
+- **SVG**: Expects a self-contained SVG (with embedded raster images). Representable `<text>` elements are lifted into native Typst text while geometry, clipping paths, group opacity, gradients, and skewed text stay intact in paint-ordered SVG layers. Text already converted to outlines stays geometry.
 
 ## Development
 
