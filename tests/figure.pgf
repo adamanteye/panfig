@@ -1,0 +1,15 @@
+% A PGF path with a label and a nested drawing scope.
+\begingroup
+\makeatletter
+\begin{pgfpicture}%
+  \begin{pgfscope}%
+    \pgfsetlinewidth{0.8pt}%
+    \pgfpathmoveto{\pgfqpoint{0pt}{0pt}}%
+    \pgfpathlineto{\pgfqpoint{30pt}{10pt}}%
+    \pgfusepath{stroke}%
+    \pgfcoordinate{tip}{\pgfqpoint{30pt}{10pt}}%
+    \pgftext[at={\pgfpointanchor{tip}{center}},left]{峰值 \textbf{A}}%
+  \end{pgfscope}%
+\end{pgfpicture}%
+\makeatother
+\endgroup

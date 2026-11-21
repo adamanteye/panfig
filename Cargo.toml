@@ -1,0 +1,31 @@
+[workspace]
+resolver = "2"
+members = ["tex", "image"]
+
+[package]
+name = "panfig"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Xuelin Yang <xuelin@adamanteye.cc>"]
+description = "Import PGF, TikZ and SVG figures as Typst content"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+base64 = "0.22"
+panfig-image = { path = "image" }
+kurbo = "0.11.3"
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+svgtypes = "0.15"
+roxmltree = "0.20"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-minimal-protocol = "0.2.1"
+
+[profile.release]
+lto = true
+opt-level = "s"
+strip = true

@@ -1,0 +1,11 @@
+/target/
+
+/tex/__pycache__/
+
+/examples/*.pdf
+/examples/*.html
+/examples/*.png
+!/examples/*-img[0-9]*.png
+
+/runtime/*
+!/runtime/NOTICE

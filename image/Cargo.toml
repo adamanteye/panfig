@@ -1,0 +1,9 @@
+[package]
+name = "panfig-image"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+imagesize = "0.13"
+roxmltree = "0.20"

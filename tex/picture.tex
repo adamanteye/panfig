@@ -1,0 +1,43 @@
+% configure graphicx to place host-provided images in the SVG output.
+\makeatletter
+\DeclareGraphicsRule{.png}{panfig}{.png}{}
+\DeclareGraphicsRule{.jpg}{panfig}{.jpg}{}
+\DeclareGraphicsRule{.jpeg}{panfig}{.jpeg}{}
+\DeclareGraphicsRule{.svg}{panfig}{.svg}{}
+\DeclareGraphicsExtensions{.png,.jpg,.jpeg,.svg}
+\def\pgfsys@imagesuffixlist{:.png:.jpg:.jpeg:.svg:}
+% report the lower corners of the text box below its baseline.
+\def\pgf@after@text{{%
+  \def\pgf@text@hshift{center}\def\pgf@text@vshift{center}%
+  \expandafter\pgf@text@setkeys\expandafter{\pgf@text@options}%
+  \csname pgf@halign\pgf@text@hshift\endcsname
+  \csname pgf@valign\pgf@text@vshift\endcsname
+  \pgfapproximatenonlineartransformation
+  \def\panfig@corner##1##2{\pgf@process{\pgfpointtransformed{\pgfqpoint{##1}{##2}}}\pgf@protocolsizes{\pgf@x}{\pgf@y}}%
+  \panfig@corner{0pt}{-\dp\pgf@hbox}\panfig@corner{\wd\pgf@hbox}{-\dp\pgf@hbox}%
+  \panfig@corner{0pt}{\ht\pgf@hbox}\panfig@corner{\wd\pgf@hbox}{\ht\pgf@hbox}%
+  \pgfqboxsynced{\pgf@hbox}}}
+\let\panfig@draftimage\pgf@declaredraftimage
+\def\pgf@declaredraftimage#1#2{%
+  \ifpgf@draftmode\panfig@draftimage{#1}{#2}%
+  \else\pgferror{Missing panfig image: #2}\fi}
+\define@key{Gin}{interpolate}[true]{}
+\def\Gread@panfig#1{\def\Gin@llx{0}\def\Gin@lly{0}\input{#1.panfig-size}}
+\def\Ginclude@panfig#1{\special{panfig:image \number\Gin@req@width\space\number\Gin@req@height\space\panfigimagefile}}
+% keep the SVG driver's growing token list in short pieces. PGF expands the
+% complete path at paint time, including when a path is reused for clipping.
+\newcount\panfig@pieces
+\newcount\panfig@commands
+\let\panfig@append\pgf@sys@addtosvgpath
+\def\pgf@sys@addtosvgpath#1{%
+  \ifx\pgf@sys@svgpath\pgfutil@empty\global\panfig@commands=0\relax\fi
+  \ifnum\panfig@commands=32
+    \global\advance\panfig@pieces by1
+    \expandafter\global\expandafter\let\csname panfig@piece@\the\panfig@pieces\endcsname\pgf@sys@svgpath
+    \xdef\pgf@sys@svgpath{\expandafter\noexpand\csname panfig@piece@\the\panfig@pieces\endcsname}%
+    \global\panfig@commands=0\relax
+  \fi
+  \global\advance\panfig@commands by1
+  \panfig@append{#1}}
+\makeatother
+\providecommand{\mathdefault}[1]{#1}
