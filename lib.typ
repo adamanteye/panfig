@@ -97,7 +97,7 @@
     (job, json(tex-engine().compile(bytes(job.defs + job.declarations + job.document), encode(job.files))))
   }
 
-  let canvas(entries, viewport: none) = {
+  let canvas(entries, viewport: none, width: auto, height: auto, fit: "cover", warnings: ()) = {
     let (x, y, w, h) = if viewport != none { point(viewport) }
       else if entries.len() == 0 { (0pt, 0pt, 0pt, 0pt) }
       else {
@@ -105,9 +105,30 @@
         let y = calc.min(..entries.map(e => e.y))
         (x, y, calc.max(..entries.map(e => e.x + e.width)) - x, calc.max(..entries.map(e => e.y + e.height)) - y)
       }
-    box(width: w, height: h, clip: viewport != none, {
+    let frame = box(width: w, height: h, clip: viewport != none, {
+      // surface missing TeX fonts as native Typst warnings without altering figure geometry.
+      for font in warnings { place(hide(text(font: font)[a])) }
       for e in entries { place(top + left, dx: e.x - x, dy: e.y - y, e.body) }
     })
+    // fractional heights participate in the surrounding vertical flow.
+    let container = if type(height) == fraction {
+      block.with(breakable: false)
+    } else { box }
+    container(width: width, height: height, layout(size => {
+      if w == 0pt or h == 0pt { return frame }
+      let (sx, sy) = (size.width / w, size.height / h)
+      let proportional = calc.min(sx, sy)
+      if width == auto and height == auto { proportional = calc.min(1, proportional) }
+      if width == auto { sx = proportional }
+      if height == auto { sy = proportional }
+      let (target-w, target-h) = (w * sx, h * sy)
+      let uniform = (cover: calc.max(sx, sy), contain: calc.min(sx, sy), stretch: none).at(fit)
+      if uniform != none { (sx, sy) = (uniform, uniform) }
+      box(width: target-w, height: target-h,
+        clip: fit == "cover" and (w * sx > target-w or h * sy > target-h),
+        place(top + left, dx: (target-w - w * sx) / 2, dy: (target-h - h * sy) / 2,
+          scale(x: 100% * sx, y: 100% * sy, origin: top + left, frame)))
+    }))
   }
 
   let place-box(layer, e) = {
@@ -141,51 +162,39 @@
       place(top + left, dx: entry.x - x, dy: entry.y - y, entry.body)))
   }
 
-  /// import a filename, path, raw block, string or bytes as a Typst figure.
-  let import-figure(format: auto, load: none, preamble: "", resolve: none, ..input) = context {
-    assert(input.named() == (:), message: "Unknown panfig option: " + input.named().keys().join(", "))
-    assert(input.pos().len() == 1, message: "Pass one drawing source or filename.")
-    let source = input.pos().first()
-    let (format, load, resolve) = (format, load, resolve)
-    let lang = none
+  let unpack-source(source) = {
+    if type(source) == content {
+      assert(source.func() == raw, message: "Pass a raw code block for inline drawing source.")
+      return (source.text, source.at("lang", default: none), false)
+    }
     let is-file = type(source) == str and not source.contains("\\") and (
       source.contains(regex("(?i)^[^\r\n]+[.](pgf|tikz|tex|svg|typ|cetz)$"))
       and not source.starts-with(regex("^\\s*(%|<)"))
     )
-    let path-loader = false
+    (source, if is-file { lower(source.split(".").last()) }, is-file)
+  }
+
+  /// import a filename, path, raw block, string or bytes as a Typst figure.
+  let import-figure(format: auto, resolve: none,
+    width: auto, height: auto, fit: "cover", ..input) = context {
+    let (source, lang, is-file) = unpack-source(..input)
+    let format = format
+    let resource-path = resolve
     if is-file {
       let filename = source
-      lang = lower(filename.split(".").last())
       // forwarding the original argument lets path resolve it at the document's call site.
       source = if resolve == none { path(..input) } else { resolve(filename) }
-      assert(type(source) == path, message: "resolve must return a Typst path.")
-      if load == none {
-        if resolve == none {
-          resolve = name => {
-            assert(not filename.split("/").contains("..") and path(filename) == source,
-              message: "For linked project files, pass resolve: p => path(p) (or bind #let panfig = panfig.with(resolve: p => path(p))) at the document call site.")
-            path(name)
-          }
-        }
-        let dir = filename.replace(regex("[^/]*$"), "")
-        path-loader = true
-        load = name => resolve(if name.starts-with("/") { name } else { dir + name })
-      }
-    } else {
-      if type(source) == content {
-        assert(source.func() == raw, message: "Pass a raw code block for inline drawing source.")
-        lang = source.at("lang", default: none)
-        source = source.text
-      }
-      if load == none and resolve != none {
-        path-loader = true
-        load = resolve
-      }
+      let caller-path = if resolve != none { resolve } else { name => {
+        assert(not filename.split("/").contains("..") and path(filename) == source,
+          message: "For linked project files, pass resolve: p => path(p) at the document call site.")
+        path(name)
+      }}
+      let dir = filename.replace(regex("[^/]*$"), "")
+      resource-path = name => caller-path(if name.starts-with("/") { name } else { dir + name })
     }
     let resource(name) = {
-      assert(load != none, message: "panfig needs " + repr(name) + ". For linked files use resolve: p => path(p), or provide a load dictionary.")
-      let data = if type(load) == dictionary { load.at(name, default: none) } else { load(name) }
-      if type(data) == path { read(data, encoding: none) } else { data }
+      assert(resource-path != none, message: "To read " + repr(name) + ", pass resolve: p => path(p) at the document call site.")
+      read(resource-path(name), encoding: none)
     }
     let inputs = (:)
     let input = if type(source) == path { read(source, encoding: none) } else { bytes(source) }
@@ -200,15 +209,13 @@
     let warnings = ()
     let doc = if format == "svg" {
       json(wasm.read_svg(input, bytes("svg")))
-    } else if preamble != "" { (tex: "") } else {
+    } else {
       json(wasm.read_pgf(input, encode(inputs)))
     }
     while "input" in doc {
       let name = doc.input
       assert(name not in inputs, message: "repeated PGF input request " + repr(name))
-      let data = resource(name)
-      assert(data != none, message: "Missing PGF input " + repr(name))
-      inputs.insert(name, str(data))
+      inputs.insert(name, str(resource(name)))
       doc = json(wasm.read_pgf(input, encode(inputs)))
     }
     if "tex" in doc {
@@ -225,28 +232,14 @@
         labels += extra
         files.insert(name, packed(source))
       }
-      let chemistry = if main.starts-with("%% Creator: Matplotlib, PGF backend") and preamble == "" and main.contains("%%   \\usepackage[version=4]{mhchem}") {
+      let chemistry = if main.starts-with("%% Creator: Matplotlib, PGF backend") and main.contains("%%   \\usepackage[version=4]{mhchem}") {
         let code = main.replace(regex("(?m)^\\s*%[^\\n]*"), "")
         let other = code.replace(regex("\\\\ce\\s*\\{(?:\\^[0-9]+)?(?:[A-Z][a-z]?[0-9]*)+\\}"), "")
         assert(not other.contains(regex("\\\\(?:ce|cf|pu|mhchemoptions)\\b")),
-          message: "This figure requests mhchem v4 syntax. The bundled mhchem is v3.11. Supply a compatible preamble or render the original with a v4 TeX installation.")
+          message: "This figure requests mhchem v4 syntax. The bundled mhchem is v3.11. Render the original with a v4 TeX installation.")
         "\\usepackage[version=3]{mhchem}\n"
       } else { "" }
-      let document = "\\usepackage{amsmath}\n" + chemistry + preamble + "\n\\begin{document}\n" + main + "\n\\end{document}\n"
-      // preload declared resources so optional TeX probes see the caller's actual files.
-      if type(load) == dictionary {
-        for name in load.keys() {
-          if name in files { continue }
-          let data = resource(name)
-          if data == none { continue }
-          if lower(name).ends-with(".tex") or lower(name).ends-with(".pgf") {
-            let (source, extra, decls) = prepare(str(data), files.len()+1)
-            declarations += decls
-            labels += extra
-            files.insert(name, packed(source))
-          } else { files.insert(name, packed(data)) }
-        }
-      }
+      let document = "\\usepackage{amsmath}\n" + chemistry + "\n\\begin{document}\n" + main + "\n\\end{document}\n"
       if math-scope == none and labels.any(((_, item)) => needs-math(item.runs)) {
         math-scope = load-mitex()
       }
@@ -254,25 +247,19 @@
       let (job, result) = compile(job, math-scope: math-scope)
       while "error" in result {
         let pending = result.missing.filter(n => n not in job.files)
-        assert(load != none and pending.len() > 0 and type(load) != dictionary, message: result.error)
-        assert(pending.len() == 1 or (not path-loader and type(load) == function), message: result.error + "\nProvide a load dictionary for extensionless images.")
-        let found = false
-        for name in pending {
-          let data = resource(name)
-          if data == none { continue }
-          if name.ends-with(".pgf") or name.ends-with(".tex") {
-            let (source, extra, decls) = prepare(str(data), job.files.len()+1)
-            if math-scope == none and extra.any(((_, item)) => needs-math(item.runs)) {
-              math-scope = load-mitex()
-            }
-            job.declarations += decls
-            job.labels += extra
-            job.files.insert(name, packed(source))
-          } else { job.files.insert(name, packed(data)) }
-          found = true
-          break
-        }
-        assert(found, message: result.error)
+        if pending.len() == 0 { panic(result.error) }
+        if pending.len() > 1 { panic(result.error + "\nSpecify the linked filename with its extension.") }
+        let name = pending.first()
+        let data = resource(name)
+        if name.ends-with(".pgf") or name.ends-with(".tex") {
+          let (source, extra, decls) = prepare(str(data), job.files.len()+1)
+          if math-scope == none and extra.any(((_, item)) => needs-math(item.runs)) {
+            math-scope = load-mitex()
+          }
+          job.declarations += decls
+          job.labels += extra
+          job.files.insert(name, packed(source))
+        } else { job.files.insert(name, packed(data)) }
         (job, result) = compile(job, math-scope: math-scope)
       }
       host-labels = job.labels.to-dict()
@@ -303,14 +290,7 @@
         place-box(layer, label(body, layer.anchor))
       } else if layer.kind == "image" {
         let name = layer.file
-        if not name.split("/").last().contains(".") {
-          assert(type(load) == dictionary, message: "Give the image an extension or include it in the load dictionary: " + name)
-          name = (".png", ".jpg", ".jpeg", ".svg").map(ext => name + ext).find(n => n in load)
-          assert(name != none, message: "Missing image " + layer.file)
-        }
         let data = resource(name)
-        assert(data != none, message: "Missing image " + name)
-        let data = bytes(data)
         let (w, h) = json(wasm.image_size(data, bytes(name)))
         let width = layer.width
         let height = layer.height
@@ -331,13 +311,7 @@
       }
       entries.push(if "clip" in layer { clip-entry(entry, layer.clip) } else { entry })
     }
-    let figure = canvas(entries, viewport: viewport)
-    if warnings.len() == 0 { return figure }
-    // surface missing TeX fonts as native Typst warnings without altering figure geometry.
-    box({
-      for font in warnings { place(hide(text(font: font)[a])) }
-      figure
-    })
+    canvas(entries, viewport: viewport, width: width, height: height, fit: fit, warnings: warnings)
   }
   import-figure
 }

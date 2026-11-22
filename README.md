@@ -8,32 +8,29 @@ elements so figures inherit your document fonts and work with normal `set` and
 `show` rules. Vector geometry is coalesced into paint-ordered SVG layers, and
 PGF/TikZ code that needs TeX runs in a bundled WebAssembly e-TeX engine.
 
-Requires Typst 0.15+.
+Requires Typst 0.15 or later. [panfig on Typst Universe](https://typst.app/universe/package/panfig/)
 
 ## Usage
 
 ```typst
-#import "lib.typ": panfig
+#import "@preview/panfig:0.1.0": panfig
 
-#figure(
-  panfig("examples/hydrogen.pgf"),
-  caption: [Hydrogen atom wavefunction probability densities],
-)
+#panfig(`\begin{tikzpicture}\draw[->] (0,0) -- (2,0);\end{tikzpicture}`)
 ```
 
-Self-contained figures work without extra options, even across package or
-subdirectory boundaries. When a figure references external files (such as
-Matplotlib's `\includegraphics` images or `\input`) across package or directory
-boundaries, Typst cannot resolve sibling paths from inside a library; thus
-panfig has to bind `resolve` once at the top of your document (or pass it on
-that call):
+You can also pass the path to a figure in your project. For figures with
+linked files, bind `resolve` in your document so panfig can find each file
+relative to the figure. Give linked images their file extensions (for example,
+`\includegraphics{plot.png}`). To try the Matplotlib example below, copy
+`hydrogen.pgf` and its four PNGs into an `examples/` directory in your project.
+The [complete example](examples/hydrogen.typ) uses these same files.
 
 ```typst
-#import "lib.typ": panfig
+#import "@preview/panfig:0.1.0": panfig
 #let panfig = panfig.with(resolve: p => path(p))
 
 #figure(
-  panfig("examples/hydrogen.pgf"),
+  panfig("examples/hydrogen.pgf", width: 8cm, height: 6cm, fit: "contain"),
   caption: [Hydrogen atom wavefunction probability densities],
 )
 ```
@@ -42,6 +39,8 @@ Because lifted labels are ordinary Typst text, you can restyle or replace them
 with a scoped `show` rule:
 
 ```typst
+#import "@preview/panfig:0.1.0": panfig
+
 #{
   show "peak": [$E_"max"$]
   panfig(```svg
@@ -53,39 +52,24 @@ with a scoped `show` rule:
 }
 ```
 
-See [examples/hydrogen.typ](examples/hydrogen.typ) for the complete example.
-
 ## API
 
 ```typst
 panfig(
   source,
   format: auto,
-  preamble: "",
   resolve: none,
-  load: none,
+  width: auto,
+  height: auto,
+  fit: "cover",
 )
 ```
 
 - `source`: a caller-relative filename, Typst `path`, raw block, source string, or `bytes`.
+- `width` and `height` size the whole figure, including labels. As with Typst's [`image`](https://typst.app/docs/reference/visualize/image/), lengths and percentages resolve on their respective axes. A fractional height such as `1fr` takes a share of the remaining vertical space. With both dimensions set to `auto`, the drawing uses its natural size up to the available space.
+- `fit` controls how the drawing fills an area with a different aspect ratio. The default `"cover"` centers and crops it to fill the area. Use `"contain"` to show the entire drawing with space on either side or above and below, or `"stretch"` to scale each axis independently.
 - `format`: `auto` (default), `"pgf"` (aliases: `"tikz"`, `"tex"`, `"latex"`), or `"svg"`.
-- `preamble`: extra LaTeX preamble lines for TeX-compiled figures.
 - `resolve`: optional caller-site path resolver (`resolve: p => path(p)`). Not needed for self-contained figures; bind `#let panfig = panfig.with(resolve: p => path(p))` when importing figures that reference external files via `\input` or `\includegraphics` across package or directory boundaries.
-- `load`: a dictionary or function supplying referenced files (for example `load: ("plot.jpg": path("figures/plot.jpg"))`). Required for extensionless or optional images in TeX.
-
-## Notes
-
-- **PGF and TikZ**: The Rust reader handles static Matplotlib paths, clipping, affine transforms, marker reuse, and text with inline math, coalescing geometry into paint-ordered SVG layers while lifting labels into Typst. Linked images load through the same caller-relative resolver as the figure. Full TikZ, macros, and complex layouts run in the bundled e-TeX/PGF engine, which ships a fixed LaTeX2e 2020 macro environment (`amsmath`, PGF, and `mhchem` v3.11) without bundled fonts. Supported text and math are lifted into Typst and rendered with your document/system fonts; missing fonts produce a Typst warning. XeTeX/LuaTeX primitives and PDF/PostScript-only specials are not supported.
-- **SVG**: Expects a self-contained SVG (with embedded raster images). Representable `<text>` elements are lifted into native Typst text while geometry, clipping paths, group opacity, gradients, and skewed text stay intact in paint-ordered SVG layers. Text already converted to outlines stays geometry.
-
-## Development
-
-Prebuilt plugins and TeX runtime assets in `runtime/` are not tracked in git; build them locally (or unpack a release archive) before running Typst:
-
-```sh
-make all     # build runtime/panfig.wasm and runtime/latex.wasm + TeX assets
-make check   # run Rust and Typst tests
-```
 
 ## License
 

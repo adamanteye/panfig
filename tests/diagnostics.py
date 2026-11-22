@@ -1,6 +1,7 @@
 """exercise resource resolution and diagnostics through the public Typst package."""
 
 import json
+import tomllib
 from pathlib import Path
 from subprocess import run
 from tempfile import TemporaryDirectory
@@ -8,15 +9,41 @@ from tempfile import TemporaryDirectory
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def check_fit(directory):
+    entry = directory / "fit.typ"
+    entry.write_text(r'''#import "/lib.typ": panfig
+#set page(width: 64pt, height: 64pt, margin: 0pt)
+#let drawing = ```svg
+<svg xmlns="http://www.w3.org/2000/svg" width="80pt" height="40pt" viewBox="0 0 80 40">
+  <path d="M0 0h80v40H0z" fill="red"/>
+  <path d="M0 0h20v10H0z M60 30h20v10H60z" fill="blue"/>
+</svg>
+```
+#for fit in ("cover", "contain", "stretch") {
+  for render in (panfig, image) {
+    page(render(bytes(drawing.text), width: 64pt, height: 64pt, fit: fit))
+  }
+}''')
+    run(["typst", "compile", "--root", ROOT, "--ppi", "72", entry, directory / "fit-{p}.png"], check=True)
+    for page in (1, 3, 5):
+        assert (directory / f"fit-{page}.png").read_bytes() == (directory / f"fit-{page + 1}.png").read_bytes()
+
+
 def main():
     with TemporaryDirectory(dir=ROOT / "target") as work:
         directory = Path(work)
+        check_fit(directory)
         entry = directory / "main.typ"
-        # compile the Matplotlib example through its caller-relative resource resolver.
+        # resolve the example's public package import to the current checkout.
+        manifest = tomllib.loads((ROOT / "typst.toml").read_text())["package"]
+        packages = directory / "packages"
+        package = packages / "preview" / manifest["name"] / manifest["version"]
+        package.parent.mkdir(parents=True)
+        package.symlink_to(ROOT, target_is_directory=True)
         deps = directory / "deps.json"
         run(
             [
-                "typst", "compile", "--root", ROOT, "--deps", deps,
+                "typst", "compile", "--root", ROOT, "--package-path", packages, "--deps", deps,
                 ROOT / "examples/hydrogen.typ", directory / "hydrogen.pdf",
             ],
             cwd=ROOT,
@@ -29,23 +56,26 @@ def main():
 
         source = directory / "input.cetz"
         source.write_text("let x = 1")
+        (directory / "img.svg").write_text('<svg width="-1pt" height="1pt"/>')
         cases = [
+            ('#panfig("input.cetz", preamble: "")', "unexpected argument: preamble"),
+            ('#panfig("input.cetz", load: (:))', "unexpected argument: load"),
             (
                 '#panfig("input.cetz", labels: (:))',
-                "Unknown panfig option: labels",
+                "unexpected argument: labels",
             ),
             ('#panfig("input.cetz")', "Use CeTZ canvases directly"),
             (
-                r'#panfig("\\IfFileExists{opt.tex}{}{}\\undefinedcmd", preamble: "%")',
+                r'#panfig("\\IfFileExists{opt.tex}{}{}\\undefinedcmd")',
                 "Undefined control sequence",
             ),
             (
-                r'#panfig("\\input{absent}", load: (:))',
-                'Missing PGF input "absent.tex"',
+                r'#panfig("\\input{absent}", resolve: p => path(p))',
+                'file not found',
             ),
             (
-                r'#panfig("\\begin{pgfpicture}\\pgftext{\\includegraphics{img.svg}}\\end{pgfpicture}", '
-                r'preamble: "%", load: ("img.svg": bytes("<svg width=\"-1pt\" height=\"1pt\"/>")))',
+                r'#panfig("\\relax\\begin{pgfpicture}\\pgftext{\\includegraphics{img.svg}}\\end{pgfpicture}", '
+                r'resolve: p => path(p))',
                 "invalid intrinsic dimensions",
             ),
         ]

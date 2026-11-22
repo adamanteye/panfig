@@ -1,6 +1,8 @@
 #import "../lib.typ": panfig
 
 #let pgf(body) = "\\begin{pgfpicture}" + body + "\\end{pgfpicture}"
+// a TeX primitive exercises the engine fallback alongside the native PGF reader.
+#let prefixes = ("", "\\relax ")
 #let mono = "\\fontspec{DejaVu Sans Mono}\\fontsize{12bp}{14bp}\\selectfont iiiiiiiiiiiiiii"
 #context {
   let w = measure(text(
@@ -8,19 +10,18 @@
     size: 12pt,
     "iiiiiiiiiiiiiii",
   )).width
-  for preamble in ("", "% force TeX") {
+  for prefix in prefixes {
     assert(
       calc.abs(
         measure(panfig(
-          pgf("\\pgftext{" + mono + "}"),
-          preamble: preamble,
+          prefix + pgf("\\pgftext{" + mono + "}"),
         )).width
           - w,
       )
         < 0.01pt,
     )
     let height(body) = {
-      measure(panfig(pgf("\\pgftext{" + body + "}"), preamble: preamble)).height
+      measure(panfig(prefix + pgf("\\pgftext{" + body + "}"))).height
     }
     assert(height("Hg") > height("H") + 1pt)
   }
@@ -73,6 +74,21 @@
 ```
 #panfig(inkscape)
 #context assert.eq(measure(panfig(inkscape)), (width: 80pt, height: 40pt))
+#context {
+  let svg = bytes(spectrum.text)
+  for options in (
+    (:), (width: 50% + 6pt), (height: 24pt), (height: 75%), (height: 1fr),
+    (width: 60pt, height: 0pt), (width: 75%, height: 50%),
+    (width: 80pt, height: 60pt, fit: "contain"), (width: 80pt, height: 60pt, fit: "stretch"),
+  ) {
+    for region in ((:), (width: 120pt, height: 80pt), (width: 60pt, height: 20pt)) {
+      let actual = measure(panfig(svg, ..options), ..region)
+      let expected = measure(image(svg, ..options), ..region)
+      assert(calc.abs(actual.width - expected.width) < 0.001pt)
+      assert(calc.abs(actual.height - expected.height) < 0.001pt)
+    }
+  }
+}
 
 #panfig("\\begin{tikzpicture}\\node (dot) at (1,2) {Native};\\end{tikzpicture}")
 
@@ -100,25 +116,17 @@
   ))
 }
 
-#let icon = bytes(
-  "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"2pt\" height=\"1pt\"><rect width=\"2\" height=\"1\"/></svg>",
-)
-#let resources = (
-  "sub/one.tex": "\\input{two}",
-  "two.tex": "\\pgftext{\\includegraphics{icon}}",
-  "icon.svg": icon,
-)
+#let resolve-test-file(name) = path("fixtures/" + name)
 #context {
-  for preamble in ("", "% force TeX") {
+  for prefix in prefixes {
     let size = measure(panfig(
-      pgf("\\input{sub/one.tex}"),
-      preamble: preamble,
-      load: resources,
+      prefix + pgf("\\input{sub/one.tex}"),
+      resolve: resolve-test-file,
     ))
     assert(calc.abs(size.width - 2pt) < 0.01pt)
     assert(calc.abs(size.height - 1pt) < 0.01pt)
   }
-  assert.eq(measure(panfig(raw(str(icon), lang: "svg"))), (
+  assert.eq(measure(panfig(raw(read("fixtures/icon.svg"), lang: "svg"))), (
     width: 2pt,
     height: 1pt,
   ))
@@ -152,11 +160,11 @@
   panfig(pgf("\\pgftext{$P_{4\\ell}(r) = r^2 |R_{4\\ell}(r)|^2$}"))
   panfig(pgf("\\pgftext{$\\|\\psi\\| + \\left|\\frac{a}{b}\\right| + \\big|x\\big|$}"))
   let clipped = pgf("\\pgfpathrectangle{\\pgfpointorigin}{\\pgfqpoint{80bp}{40bp}}\\pgfusepath{use as bounding box, clip}\\pgftext[at={\\pgfqpoint{40bp}{20bp}},rotate=90]{$x / a_0$}")
-  for preamble in ("", "% force TeX") { panfig(clipped, preamble: preamble) }
+  for prefix in prefixes { panfig(prefix + clipped) }
 }
 
 #context {
-  let picture(body) = measure(panfig(pgf(body), load: resources))
+  let picture(body) = measure(panfig(pgf(body), resolve: resolve-test-file))
   let stamp = "\\pgftext[left,bottom]{\\includegraphics[width=4bp,height=2bp]{icon.svg}}"
   let rect = "\\pgfpathrectangle{\\pgfqpoint{3bp}{6bp}}{\\pgfqpoint{5bp}{7bp}}"
   assert.eq(picture(rect + "\\pgfusepath{use as bounding box,clip}" + stamp),
@@ -191,6 +199,9 @@
   let bound = panfig.with(resolve: p => path(p))
   let expected-fig = measure(panfig("figure.pgf"))
   assert.eq(measure(bound("figure.pgf")), expected-fig)
+  let half = measure(bound("figure.pgf", width: 50%), width: expected-fig.width)
+  assert.eq(half.width, expected-fig.width / 2)
+  assert(calc.abs(half.height - expected-fig.height / 2) < 0.001pt)
   assert.eq(measure(bound(path("figure.pgf"))), expected-fig)
   assert.eq(measure(bound(spectrum)), measure(panfig(spectrum)))
   assert.eq(measure(bound(pgf("\\pgftext{Hi}"))), measure(panfig(pgf("\\pgftext{Hi}"))))

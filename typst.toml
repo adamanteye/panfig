@@ -6,7 +6,10 @@ license = "MIT"
 compiler = "0.15.0"
 entrypoint = "lib.typ"
 description = "Import PGF, TikZ and SVG figures as Typst content."
+repository = "https://github.com/adamanteye/panfig"
 exclude = [
+    "examples",
+    ".github",
     "src",
     "image",
     "tests",
