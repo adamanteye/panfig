@@ -14,7 +14,6 @@ import tarfile
 
 ROOT = Path(__file__).resolve().parents[1]
 CACHE = ROOT / "target" / "tex-build"
-RUNTIME = ROOT / "runtime"
 REGISTRY = "https://static.crates.io/crates/rust_tikz/rust_tikz-0.1.0.crate"
 ARCHIVE = "https://ftp.math.utah.edu/pub/tex/historic/systems/texlive"
 PACKAGES = [
@@ -66,12 +65,17 @@ def compile_engine(wd, engine):
     flags = shlex.split(env.get(key, "")) + ["-C", "link-arg=--no-stack-first",
                                             "-C", "link-arg=--global-base=72089600"]
     env[key] = " ".join(flags)
+    env["PANFIG_FORMAT"] = str(wd / "format.gz")
+    env["PANFIG_TEXMF"] = str(wd / "texmf.tar.gz")
     build = ROOT / "target" / "tex"
     subprocess.run(["cargo", "build", "--locked", "--release", "--manifest-path", ROOT/"tex/Cargo.toml",
                     "--target", target, "--target-dir", build], check=True, env=env)
     subprocess.run(["wasm-merge", "--all-features", "--rename-export-conflicts",
                     build/target/"release/panfig_tex.wasm", "library", guest, "tex",
                     "-o", wd/"latex.wasm"], check=True)
+    subprocess.run(["wasm-opt", "-Oz", "--enable-bulk-memory", "--enable-nontrapping-float-to-int",
+                    "--enable-sign-ext", "--enable-mutable-globals",
+                    wd/"latex.wasm", "-o", wd/"latex.wasm"], check=True)
 
 
 def build(wd):
@@ -79,7 +83,7 @@ def build(wd):
     with tarfile.open(crate) as package:
         base = "rust_tikz-0.1.0/"
         assets = base + "src/assets/"
-        compile_engine(wd, package.extractfile(assets + "tex.wasm").read())
+        engine = package.extractfile(assets + "tex.wasm").read()
         (wd/"format.gz").write_bytes(gzip.compress(package.extractfile(assets+"core.dump").read(), mtime=0))
         (wd/"rust-tikz.LICENSE").write_bytes(package.extractfile(base+"LICENSE").read())
         with tarfile.open(fileobj=package.extractfile(assets+"tex_files.tar.gz"), mode="r|gz") as bundle:
@@ -98,12 +102,12 @@ def build(wd):
             info.size = len(data)
             package.addfile(info, io.BytesIO(data))
     (wd/"texmf.tar.gz").write_bytes(gzip.compress(buf.getvalue(), mtime=0))
-    for file in ("latex.wasm", "format.gz", "texmf.tar.gz", "rust-tikz.LICENSE"):
-        shutil.copyfile(wd/file, RUNTIME/file)
+    compile_engine(wd, engine)
+    for file in ("latex.wasm", "rust-tikz.LICENSE"):
+        shutil.copyfile(wd/file, ROOT/file)
 
 
 if __name__ == "__main__":
     CACHE.mkdir(parents=True, exist_ok=True)
-    RUNTIME.mkdir(exist_ok=True)
     with TemporaryDirectory(dir=CACHE) as work:
         build(Path(work))

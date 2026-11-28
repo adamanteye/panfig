@@ -277,11 +277,14 @@ struct Runtime {
 
 thread_local! { static RUNTIME: RefCell<Runtime> = RefCell::default(); }
 
+const FORMAT: &[u8] = include_bytes!(env!("PANFIG_FORMAT"));
+const TEXMF: &[u8] = include_bytes!(env!("PANFIG_TEXMF"));
+
 /// initialize an immutable Typst plugin transition, shared by all compilations.
 #[wasm_minimal_protocol::wasm_func]
-pub fn initialize(bundle: &[u8], snapshot: &[u8]) -> Result<Vec<u8>, String> {
+pub fn initialize() -> Result<Vec<u8>, String> {
     let mut runtime = Runtime::default();
-    let mut fmt = flate2::read::GzDecoder::new(snapshot);
+    let mut fmt = flate2::read::GzDecoder::new(FORMAT);
     let mut page = [0u8; 65536];
     for offset in (0..TEX_MEMORY).step_by(page.len()) {
         fmt.read_exact(&mut page).map_err(|e| e.to_string())?;
@@ -295,7 +298,7 @@ pub fn initialize(bundle: &[u8], snapshot: &[u8]) -> Result<Vec<u8>, String> {
             }
         }
     }
-    let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(bundle));
+    let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(TEXMF));
     for entry in tar.entries().map_err(|e| e.to_string())? {
         let mut e = entry.map_err(|e| e.to_string())?;
         if e.header().entry_type().is_file() {

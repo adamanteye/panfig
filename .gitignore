@@ -7,5 +7,5 @@
 /examples/*.png
 !/examples/*-img[0-9]*.png
 
-/runtime/*
-!/runtime/NOTICE
+/*.wasm
+/rust-tikz.LICENSE

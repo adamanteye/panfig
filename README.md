@@ -73,4 +73,4 @@ panfig(
 
 ## License
 
-MIT. See [LICENSE](LICENSE) for project code and [runtime/NOTICE](runtime/NOTICE) for the TeX runtime notices.
+MIT. See [LICENSE](LICENSE) for project code. The bundled TeX runtime in `latex.wasm` builds on [rust_tikz](https://crates.io/crates/rust_tikz/0.1.0) ([rust-tikz.LICENSE](rust-tikz.LICENSE)), LaTeX2e ([LPPL](https://www.latex-project.org/lppl/)), and PGF/TikZ ([license](https://tikz.dev/license)).

@@ -51,8 +51,8 @@ def main():
         )
         inputs = {(ROOT / p).resolve() for p in json.loads(deps.read_text())["inputs"]}
         assert {ROOT / f"examples/hydrogen-img{i}.png" for i in range(4)} <= inputs
-        assert ROOT / "runtime" / "panfig.wasm" in inputs
-        assert ROOT / "runtime" / "latex.wasm" not in inputs
+        assert ROOT / "panfig.wasm" in inputs
+        assert ROOT / "latex.wasm" not in inputs
 
         source = directory / "input.cetz"
         source.write_text("let x = 1")

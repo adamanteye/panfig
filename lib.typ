@@ -1,6 +1,6 @@
 // import external figures into the current Typst layout context.
 #let panfig = {
-  let wasm = plugin("runtime/panfig.wasm")
+  let wasm = plugin("panfig.wasm")
   let encode(value) = bytes(json.encode(value))
 
   let escape(s) = s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\"", "&quot;")
@@ -74,10 +74,7 @@
   }
 
   let packed(data) = str(wasm.pack(bytes(data)))
-  let tex-engine() = {
-    let base = plugin("runtime/latex.wasm")
-    plugin.transition(base.initialize, read("runtime/texmf.tar.gz", encoding: none), read("runtime/format.gz", encoding: none))
-  }
+  let tex-engine() = plugin.transition(plugin("latex.wasm").initialize)
   let compile(job, math-scope: none) = {
     // measure only labels added since the previous TeX retry pass.
     let pending = job.labels.slice(job.measured)
