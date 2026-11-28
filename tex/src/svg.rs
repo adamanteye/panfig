@@ -495,7 +495,7 @@ pub fn render(
     files: &HashMap<String, std::rc::Rc<Vec<u8>>>,
     images: &HashMap<String, Image>,
     missing_fonts: &[String],
-) -> Result<Vec<u8>> {
+) -> Result<super::CompileResult> {
     let mut warnings: Vec<String> = missing_fonts.to_vec();
     let mut widths_cache: HashMap<String, Option<HashMap<u32, f64>>> = HashMap::new();
     let mut pg = Page::default();
@@ -533,12 +533,10 @@ pub fn render(
                 );
                 roxmltree::Document::parse(&svg)
                     .map_err(|e| format!("invalid SVG from PGF: {e}"))?;
-                output = Some(
-                    serde_json::to_vec(
-                        &serde_json::json!({"svg": svg, "warnings": warnings}),
-                    )
-                    .map_err(|e| e.to_string())?,
-                );
+                output = Some(super::CompileResult::Figure {
+                    svg,
+                    warnings: std::mem::take(&mut warnings),
+                });
             }
             Op::PostPost { .. } => complete = true,
             Op::Push => {

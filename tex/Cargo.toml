@@ -13,8 +13,9 @@ doctest = false
 dvi = "0.2.2"
 panfig-image = { path = "../image" }
 roxmltree = "0.20"
-serde_json = "1"
+serde = { version = "1", features = ["derive"] }
 base64 = "0.22"
 flate2 = "1"
 tar = { version = "0.4", default-features = false }
+typwire.workspace = true
 wasm-minimal-protocol = "0.2.1"

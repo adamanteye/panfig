@@ -20,22 +20,28 @@ fn source(data: &[u8]) -> drawing::Result<&str> {
 /// read PGF into paint-ordered instructions, requesting TeX for dynamic programs.
 #[cfg_attr(target_arch = "wasm32", wasm_minimal_protocol::wasm_func)]
 pub fn read_pgf(data: &[u8], files: &[u8]) -> Result<Vec<u8>, String> {
-    let mut inputs = resources::Inputs::new(
-        serde_json::from_slice(files)
-            .map_err(|e| format!("invalid resource table: {e}"))?,
-    );
+    let files =
+        typwire::decode(files).map_err(|e| format!("invalid resource table: {e}"))?;
+    let mut inputs = resources::Inputs::new(&files);
     let result = pgfcodec::read_with(source(data)?, &mut inputs).and_then(|figure| {
         drawing::validate(&figure)?;
         render::layers(&figure)
     });
-    if let Some(name) = inputs.need {
-        return json(&serde_json::json!({ "input": name }));
-    }
-    match result {
-        Ok(layers) => json(&layers),
-        Err(error) if error.contains("cyclic PGF input") => Err(error),
-        Err(reason) => json(&serde_json::json!({ "tex": reason })),
-    }
+    let reply = match (inputs.need, result) {
+        (Some(name), _) => PgfResult::Input { name },
+        (_, Ok(figure)) => PgfResult::Figure(figure),
+        (_, Err(error)) if error.contains("cyclic PGF input") => return Err(error),
+        (_, Err(reason)) => PgfResult::Tex { reason },
+    };
+    typwire::encode(&reply).map_err(|e| e.to_string())
+}
+
+#[derive(serde::Serialize, serde::Deserialize, typwire::Typwire)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+enum PgfResult {
+    Figure(render::Layers),
+    Input { name: String },
+    Tex { reason: String },
 }
 
 fn json(value: &impl serde::Serialize) -> Result<Vec<u8>, String> {
@@ -54,7 +60,7 @@ pub fn labels(data: &[u8], prefix: &[u8]) -> Result<Vec<u8>, String> {
     labels::named_labels(source(data)?, source(prefix)?)
 }
 
-/// transfer binary image resources without expanding them into JSON number arrays.
+/// encode image data for embedding in an SVG data URL.
 #[cfg_attr(target_arch = "wasm32", wasm_minimal_protocol::wasm_func)]
 pub fn pack(data: &[u8]) -> Result<Vec<u8>, String> {
     use base64::{engine::general_purpose::STANDARD, Engine};
@@ -75,6 +81,16 @@ pub fn image_size(data: &[u8], file: &[u8]) -> Result<Vec<u8>, String> {
 mod tests {
     use super::pgf::Parser;
     use serde_json::{json, Value};
+
+    fn read_layers(source: &[u8]) -> Value {
+        let files =
+            typwire::encode(&std::collections::HashMap::<String, String>::new()).unwrap();
+        let response = super::read_pgf(source, &files).unwrap();
+        match typwire::decode(&response).unwrap() {
+            super::PgfResult::Figure(figure) => serde_json::to_value(figure).unwrap(),
+            _ => panic!("expected native PGF layers"),
+        }
+    }
 
     fn read_events(source: &str) -> Result<Vec<super::pgf::Event<'_>>, String> {
         let mut parser = Parser::new(source);
@@ -103,8 +119,7 @@ mod tests {
             \pgftext{separator}
             \pgfsetfillcolor{blue}\pgfsys@useobject{marker}{}
             \end{pgfpicture}";
-        let doc: Value =
-            serde_json::from_slice(&super::read_pgf(source, b"{}").unwrap()).unwrap();
+        let doc = read_layers(source);
         let layers = doc["layers"].as_array().unwrap();
         let kinds: Vec<_> = layers.iter().map(|l| l["kind"].as_str().unwrap()).collect();
         assert_eq!(kinds, ["bounds", "svg", "text", "svg"]);
@@ -142,8 +157,7 @@ mod tests {
                 \pgfpathmoveto{\pgfqpoint{0bp}{10bp}}\pgfpathlineto{\pgfqpoint{10bp}{0bp}}\pgfusepath{stroke}
             \end{pgfscope}
             \end{pgfpicture}";
-        let doc: Value =
-            serde_json::from_slice(&super::read_pgf(source, b"{}").unwrap()).unwrap();
+        let doc = read_layers(source);
         assert_eq!(doc["viewport"], json!([0., -20., 20., 20.]));
         let layers = doc["layers"].as_array().unwrap();
         assert_eq!(layers.len(), 1);
@@ -172,8 +186,7 @@ mod tests {
             \pgfsetfillcolor{red}\pgfsetfillopacity{0.5}
             \pgftext{\fontsize{10}{12}\bfseries\itshape\selectfont Hi}
             \end{pgfpicture}";
-        let doc: Value =
-            serde_json::from_slice(&super::read_pgf(source, b"{}").unwrap()).unwrap();
+        let doc = read_layers(source);
         let text = &doc["layers"][0];
         assert_eq!(text["kind"], "text");
         assert_eq!(text["opacity"], json!(0.5));

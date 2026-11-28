@@ -2,6 +2,10 @@
 resolver = "2"
 members = ["tex", "image"]
 
+[workspace.dependencies]
+# keep the wire format in sync with the Typst import in lib.typ.
+typwire = "=0.2.0"
+
 [package]
 name = "panfig"
 version = "0.1.0"
@@ -22,8 +26,9 @@ mitex = { git = "https://github.com/mitex-rs/mitex", tag = "0.2.7" }
 mitex-lexer = { git = "https://github.com/mitex-rs/mitex", tag = "0.2.7" }
 # the upstream prebuilt command table predates the Typst 0.15 symbol names.
 mitex-spec-gen = { git = "https://github.com/mitex-rs/mitex", tag = "0.2.7", features = ["generate"] }
-serde = { version = "1", features = ["derive", "rc"] }
+serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
+typwire.workspace = true
 svgtypes = "0.15"
 roxmltree = "0.20"
 

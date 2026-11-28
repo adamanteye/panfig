@@ -144,7 +144,7 @@ impl Stroke {
     }
 }
 
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, serde::Deserialize)]
 pub struct Run {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fill: Option<Color>,

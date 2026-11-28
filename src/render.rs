@@ -1,10 +1,60 @@
 //! lower a parsed PGF figure into paint-ordered SVG, native text and image layers.
 use super::drawing::*;
 use kurbo::{Affine, BezPath, Rect, Shape};
-use serde_json::{json, Value};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::Write;
 use std::rc::Rc;
+
+#[derive(Serialize, Deserialize)]
+pub(super) struct Layers {
+    layers: Vec<Layer>,
+    viewport: Option<[f64; 4]>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+enum Layer {
+    Bounds {
+        rect: [f64; 4],
+    },
+    Svg(SvgLayer),
+    Text {
+        #[serde(flatten)]
+        placement: Placement,
+        anchor: String,
+        runs: Vec<Run>,
+        font: Option<String>,
+        size: Option<f64>,
+        opacity: f64,
+    },
+    Image {
+        #[serde(flatten)]
+        placement: Placement,
+        anchor: String,
+        file: String,
+        width: Option<f64>,
+        height: Option<f64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        slice: Option<SvgLayer>,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+struct SvgLayer {
+    rect: [f64; 4],
+    svg: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct Placement {
+    at: Point,
+    scale: [f64; 2],
+    shear: f64,
+    angle: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    clip: Option<[f64; 4]>,
+}
 
 fn paint_bounds(p: &BezPath, style: &Style, transform: Affine) -> Rect {
     let bounds_of = |path: &BezPath| {
@@ -137,7 +187,7 @@ struct Batch<'a> {
 }
 
 impl Batch<'_> {
-    fn flush(&mut self, layers: &mut Vec<Value>, viewport: Option<Rect>) {
+    fn flush(&mut self, layers: &mut Vec<Layer>, viewport: Option<Rect>) {
         if self.paths.is_empty() {
             return;
         }
@@ -202,11 +252,11 @@ impl Batch<'_> {
         }
         let rect = frame(rect);
         let svg = wrap_svg(rect, &defs, &body, false);
-        layers.push(json!({"kind": "svg", "rect": rect, "svg": svg}));
+        layers.push(Layer::Svg(SvgLayer { rect, svg }));
     }
 }
 
-pub fn layers(figure: &Figure) -> Result<Value> {
+pub(super) fn layers(figure: &Figure) -> Result<Layers> {
     let mut layers = Vec::new();
     let mut batch = Batch::default();
     let mut anchors = HashMap::new();
@@ -225,23 +275,19 @@ pub fn layers(figure: &Figure) -> Result<Value> {
                 anchors.insert(name.clone(), *at);
             }
             Item::Bounds(rect) => {
-                layers.push(json!({"kind": "bounds", "rect": frame(*rect)}));
+                layers.push(Layer::Bounds { rect: frame(*rect) });
             }
-            item => {
+            Item::Image { at, .. } | Item::Text { at, .. } => {
                 batch.flush(&mut layers, figure.viewport);
-                let (at, mut layer) = match item {
-                    Item::Image { at, anchor, file, width, height } => (
-                        at,
-                        json!({"kind": "image", "anchor": anchor, "file": file, "width": width, "height": height}),
-                    ),
-                    Item::Text { at, anchor, runs, font, size, opacity } => (
-                        at,
-                        json!({"kind": "text", "anchor": anchor, "runs": runs, "font": font, "size": size, "opacity": opacity}),
-                    ),
-                    _ => unreachable!(),
-                };
                 let [x, y] = xy(at.resolve(&anchors)?);
-                layer["at"] = json!([x, -y]);
+                let mut placement = Placement {
+                    at: [x, -y],
+                    scale: [1., 1.],
+                    angle: 0.,
+                    shear: 0.,
+                    clip: None,
+                };
+                let mut slice = None;
                 let orientation = t * Affine::rotate(placed.angle.to_radians());
                 let [a, b, c, d, _, _] = orientation.as_coeffs();
                 if let Some(rect) = clip_bounds(&placed.clips, None) {
@@ -250,8 +296,8 @@ pub fn layers(figure: &Figure) -> Result<Value> {
                     }
                     let rect = frame(rect);
                     if placed.clips.iter().all(|clip| clip.rectangle.is_some()) {
-                        layer["clip"] = json!(rect);
-                    } else if matches!(item, Item::Image { .. }) {
+                        placement.clip = Some(rect);
+                    } else if matches!(placed.item, Item::Image { .. }) {
                         let mut body = String::new();
                         for i in 0..placed.clips.len() {
                             write!(body, r#"<g clip-path="url(#c{i})">"#).unwrap();
@@ -265,33 +311,50 @@ pub fn layers(figure: &Figure) -> Result<Value> {
                         for _ in &placed.clips {
                             body.push_str("</g>");
                         }
-                        layer["slice"] = json!({"rect": rect, "svg": wrap_svg(rect, &placed.clips, &body, true)});
-                        layers.push(layer);
-                        continue;
+                        slice = Some(SvgLayer {
+                            rect,
+                            svg: wrap_svg(rect, &placed.clips, &body, true),
+                        });
                     } else {
                         return Err("nonrectangular text clip".into());
                     }
                 }
                 // decompose the screen-space matrix into rotation, horizontal shear and scale.
-                let sx = a.hypot(b);
-                let sy = orientation.determinant() / sx;
-                if sx == 0. || sy == 0. || !sy.is_finite() {
-                    return Err("singular text or image transform".into());
+                if slice.is_none() {
+                    let sx = a.hypot(b);
+                    let sy = orientation.determinant() / sx;
+                    if sx == 0. || sy == 0. || !sy.is_finite() {
+                        return Err("singular text or image transform".into());
+                    }
+                    let shear = -(a * c + b * d) / (sx * sy);
+                    if shear.abs() > 1e-12 {
+                        placement.shear = shear;
+                    }
+                    placement.scale = [sx, sy];
+                    placement.angle = -b.atan2(a).to_degrees();
                 }
-                let shear = -(a * c + b * d) / (sx * sy);
-                if shear.abs() > 1e-12 {
-                    layer["shear"] = json!(shear);
-                }
-                layer["scale"] = json!([sx, sy]);
-                layer["angle"] = json!(-b.atan2(a).to_degrees());
-                layers.push(layer);
+                layers.push(match &placed.item {
+                    Item::Text { anchor, runs, font, size, opacity, .. } => Layer::Text {
+                        placement,
+                        anchor: anchor.clone(),
+                        runs: runs.clone(),
+                        font: font.clone(),
+                        size: *size,
+                        opacity: *opacity,
+                    },
+                    Item::Image { anchor, file, width, height, .. } => Layer::Image {
+                        placement,
+                        anchor: anchor.clone(),
+                        file: file.clone(),
+                        width: *width,
+                        height: *height,
+                        slice,
+                    },
+                    _ => unreachable!(),
+                });
             }
         }
     }
     batch.flush(&mut layers, figure.viewport);
-    let mut out = json!({"layers": layers});
-    if let Some(rect) = figure.viewport {
-        out["viewport"] = json!(frame(rect));
-    }
-    Ok(out)
+    Ok(Layers { layers, viewport: figure.viewport.map(frame) })
 }

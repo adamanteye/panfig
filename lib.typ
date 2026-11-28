@@ -1,7 +1,7 @@
 // import external figures into the current Typst layout context.
 #let panfig = {
+  import "@preview/typwire:0.2.0"
   let wasm = plugin("panfig.wasm")
-  let encode(value) = bytes(json.encode(value))
 
   let escape(s) = s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\"", "&quot;")
   let number(size) = json.encode(size / 1pt)
@@ -73,7 +73,6 @@
     (..entry, body: body)
   }
 
-  let packed(data) = str(wasm.pack(bytes(data)))
   let tex-engine() = plugin.transition(plugin("latex.wasm").initialize)
   let compile(job, math-scope: none) = {
     // measure only labels added since the previous TeX retry pass.
@@ -87,11 +86,12 @@
       let svg = ("<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"" + w + "pt\" height=\"" + h
         + "pt\" viewBox=\"0 0 " + w + " " + h + "\">" + entry.body + "</svg>")
       let file = id + ".svg"
-      job.files.insert(file, packed(svg))
+      job.files.insert(file, bytes(svg))
       job.defs += macro + "{\\begingroup\\catcode37=14\\relax\\lower " + number(entry.height - entry.ascent) + "bp\\hbox{\\includegraphics{" + file + "}}\\endgroup}%\n"
     }
     job.measured = job.labels.len()
-    (job, json(tex-engine().compile(bytes(job.defs + job.declarations + job.document), encode(job.files))))
+    let result = tex-engine().compile(bytes(job.defs + job.declarations + job.document), typwire.encode(job.files))
+    (job, typwire.decode(result))
   }
 
   let canvas(entries, viewport: none, width: auto, height: auto, fit: "cover", warnings: ()) = {
@@ -207,15 +207,17 @@
     let doc = if format == "svg" {
       json(wasm.read_svg(input, bytes("svg")))
     } else {
-      json(wasm.read_pgf(input, encode(inputs)))
+      let read-pgf(files) = typwire.decode(wasm.read_pgf(input, typwire.encode(files)))
+      let result = read-pgf(inputs)
+      while result.kind == "input" {
+        let name = result.name
+        assert(name not in inputs, message: "repeated PGF input request " + repr(name))
+        inputs.insert(name, str(resource(name)))
+        result = read-pgf(inputs)
+      }
+      result
     }
-    while "input" in doc {
-      let name = doc.input
-      assert(name not in inputs, message: "repeated PGF input request " + repr(name))
-      inputs.insert(name, str(resource(name)))
-      doc = json(wasm.read_pgf(input, encode(inputs)))
-    }
-    if "tex" in doc {
+    if format == "pgf" and doc.kind == "tex" {
       let prepare(data, prefix) = {
         if not data.contains("\\pgftext") and not data.contains("\\node") and not data.contains(regex("[^\\x00-\\xFF]")) { return (data, (), "") }
         let result = json(wasm.labels(bytes(data), bytes(str(prefix))))
@@ -227,7 +229,7 @@
         let (source, extra, decls) = prepare(data, files.len()+1)
         declarations += decls
         labels += extra
-        files.insert(name, packed(source))
+        files.insert(name, bytes(source))
       }
       let chemistry = if main.starts-with("%% Creator: Matplotlib, PGF backend") and main.contains("%%   \\usepackage[version=4]{mhchem}") {
         let code = main.replace(regex("(?m)^\\s*%[^\\n]*"), "")
@@ -242,7 +244,7 @@
       }
       let job = (document: document, declarations: declarations, defs: "", measured: 0, labels: labels, files: files)
       let (job, result) = compile(job, math-scope: math-scope)
-      while "error" in result {
+      while result.kind == "error" {
         let pending = result.missing.filter(n => n not in job.files)
         if pending.len() == 0 { panic(result.error) }
         if pending.len() > 1 { panic(result.error + "\nSpecify the linked filename with its extension.") }
@@ -255,8 +257,8 @@
           }
           job.declarations += decls
           job.labels += extra
-          job.files.insert(name, packed(source))
-        } else { job.files.insert(name, packed(data)) }
+          job.files.insert(name, bytes(source))
+        } else { job.files.insert(name, data) }
         (job, result) = compile(job, math-scope: math-scope)
       }
       host-labels = job.labels.to-dict()
@@ -298,7 +300,7 @@
           let (x, y, w, h) = point(layer.slice.rect)
           let mime = (png: "png", jpg: "jpeg", jpeg: "jpeg", svg: "svg+xml").at(lower(name.split(".").last()))
           let tag = ("<image x=\"" + number(e.x) + "\" y=\"" + number(e.y) + "\" width=\"" + number(e.width)
-            + "\" height=\"" + number(e.height) + "\" preserveAspectRatio=\"none\" xlink:href=\"data:image/" + mime + ";base64," + packed(data) + "\"/>")
+            + "\" height=\"" + number(e.height) + "\" preserveAspectRatio=\"none\" xlink:href=\"data:image/" + mime + ";base64," + str(wasm.pack(data)) + "\"/>")
           let svg = layer.slice.svg.replace("<!--image-->", tag)
           (x: x, y: y, width: w, height: h, body: image(bytes(svg), format: "svg", width: w, height: h))
         } else {

@@ -316,6 +316,8 @@ pub fn initialize() -> Result<Vec<u8>, String> {
 /// execute a fresh TeX job against the initialized, read-only bundle.
 #[wasm_minimal_protocol::wasm_func]
 pub fn compile(source: &[u8], files: &[u8]) -> Result<Vec<u8>, String> {
+    let inputs: HashMap<String, typwire::Bytes> =
+        typwire::decode(files).map_err(|e| format!("invalid TeX file table: {e}"))?;
     let mut fs = Files::default();
     RUNTIME.with_borrow(|rt| {
         if rt.pages.is_empty() {
@@ -329,10 +331,7 @@ pub fn compile(source: &[u8], files: &[u8]) -> Result<Vec<u8>, String> {
         Ok(())
     })?;
     let mut images = HashMap::new();
-    let inputs: HashMap<String, String> =
-        serde_json::from_slice(files).map_err(|e| e.to_string())?;
-    for (name, data) in inputs {
-        let bytes = STANDARD.decode(&data).map_err(|e| e.to_string())?;
+    for (name, bytes) in inputs {
         if let Some(mime) = image::mime(&name) {
             let (w, h) = image::image_dimensions(&bytes, mime)?;
             let key = images.len().to_string();
@@ -352,11 +351,13 @@ pub fn compile(source: &[u8], files: &[u8]) -> Result<Vec<u8>, String> {
                     .collect();
                 svg::Image::Label { width: w, height: h, content }
             } else {
-                svg::Image::Encoded(format!("data:{mime};base64,{data}"))
+                let mut url = format!("data:{mime};base64,");
+                STANDARD.encode_string(bytes, &mut url);
+                svg::Image::Encoded(url)
             };
             images.insert(key, image);
         } else {
-            fs.data.insert(name, Rc::new(bytes));
+            fs.data.insert(name, Rc::new(bytes.into_inner()));
         }
     }
     fs.data.insert(
@@ -429,10 +430,7 @@ pub fn compile(source: &[u8], files: &[u8]) -> Result<Vec<u8>, String> {
                     );
                 }
             }
-            return serde_json::to_vec(
-                &serde_json::json!({"error":message,"missing":missing}),
-            )
-            .map_err(|e| e.to_string());
+            return Ok(CompileResult::Error { error: message, missing });
         }
         let dvi = f.data.get(OUT).ok_or_else(|| {
             format!(
@@ -448,4 +446,12 @@ pub fn compile(source: &[u8], files: &[u8]) -> Result<Vec<u8>, String> {
         })?;
         svg::render(dvi, &f.data, &images, &f.missing_fonts)
     })
+    .and_then(|result| typwire::encode(&result).map_err(|e| e.to_string()))
+}
+
+#[derive(serde::Serialize, serde::Deserialize, typwire::Typwire)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+enum CompileResult {
+    Figure { svg: String, warnings: Vec<String> },
+    Error { error: String, missing: Vec<String> },
 }

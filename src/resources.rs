@@ -1,18 +1,16 @@
 //! resolve nested project inputs through the Typst caller's resource loader.
 use super::drawing::Result;
 use std::collections::{HashMap, HashSet};
-use std::rc::Rc;
 
-#[derive(Default)]
-pub struct Inputs {
-    pub files: HashMap<String, Rc<str>>,
+pub struct Inputs<'a> {
+    files: &'a HashMap<String, String>,
     pub need: Option<String>,
     active: HashSet<String>,
 }
 
-impl Inputs {
-    pub fn new(files: HashMap<String, Rc<str>>) -> Self {
-        Self { files, ..Self::default() }
+impl<'a> Inputs<'a> {
+    pub fn new(files: &'a HashMap<String, String>) -> Self {
+        Self { files, need: None, active: HashSet::new() }
     }
 
     pub fn include<T>(
@@ -20,7 +18,7 @@ impl Inputs {
         path: &str,
         parse: impl FnOnce(&str, &mut Self) -> Result<T>,
     ) -> Result<T> {
-        let Some(source) = self.files.get(path).cloned() else {
+        let Some(source) = self.files.get(path) else {
             self.need = Some(path.to_owned());
             return Err(format!("missing PGF input {path:?}"));
         };
@@ -30,7 +28,7 @@ impl Inputs {
         if self.active.len() > 128 {
             return Err("PGF input nesting exceeds 128 files".into());
         }
-        let result = parse(&source, self);
+        let result = parse(source, self);
         self.active.remove(path);
         result
     }
